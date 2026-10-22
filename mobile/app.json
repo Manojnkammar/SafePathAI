@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "SafePath AI",
+    "slug": "safepath-ai",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "platforms": [
+      "android",
+      "ios",
+      "web"
+    ],
+    "entryPoint": "./App.tsx",
+    "plugins": [
+      "expo-asset"
+    ]
+  }
+}

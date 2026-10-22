@@ -1,0 +1,23 @@
+{
+  "name": "safepath-ai-mobile",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "start": "expo start",
+    "web": "expo start --web",
+    "design-board": "python -m http.server 4173 --directory ."
+  },
+  "dependencies": {
+    "@expo/metro-runtime": "~4.0.1",
+    "expo": "~52.0.0",
+    "expo-asset": "~11.0.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-native": "0.76.5",
+    "react-native-web": "~0.19.13"
+  },
+  "devDependencies": {
+    "@types/react": "~18.3.12",
+    "typescript": "~5.3.3"
+  }
+}
