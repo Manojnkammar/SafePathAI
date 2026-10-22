@@ -35,6 +35,14 @@ async def register_user(payload: UserCreate, session: AsyncSession = Depends(get
     return await create_user(session, User(**payload.model_dump()))
 
 
+@router.get("/users/by-email", response_model=UserRead)
+async def read_user_by_email(email: str, session: AsyncSession = Depends(get_session)) -> User:
+    user = await get_user_by_email(session, email)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
 @router.get("/users/{user_id}", response_model=UserRead)
 async def read_user(user_id: str, session: AsyncSession = Depends(get_session)) -> User:
     user = await get_user(session, user_id)

@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import router as api_router
 from app.api.v1.health import router as health_router
@@ -15,5 +16,11 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="SafePath AI API", version="1.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(health_router, prefix=settings.api_prefix)
 app.include_router(api_router, prefix=settings.api_prefix)
