@@ -16,11 +16,15 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="SafePath AI API", version="1.0.0", lifespan=lifespan)
+
+origins = settings.cors_origin_list
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
+    allow_credentials=origins != ["*"],  # browsers reject credentials with a wildcard origin
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 app.include_router(health_router, prefix=settings.api_prefix)
 app.include_router(api_router, prefix=settings.api_prefix)
