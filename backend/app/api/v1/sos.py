@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import get_session
@@ -33,7 +33,7 @@ async def trigger_sos(body: SOSCreate, session: AsyncSession = Depends(get_sessi
         session,
         lat=body.lat,
         lng=body.lng,
-        incident_type=body.incident_type.value if body.incident_type else None,
+        incident_type=body.incident_type.value if body.incident_type else ("accident" if body.trigger == "accident" else None),
         severity=body.severity.value,
         message=body.message,
         user_id=body.user_id,
