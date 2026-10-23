@@ -53,3 +53,32 @@ class CommunityReport(Base):
     credibility: Mapped[float] = mapped_column(Float, default=0.0)
     validated: Mapped[bool] = mapped_column(Boolean, default=False)
     credibility_reasons: Mapped[list] = mapped_column(JSON, default=list)
+
+import uuid
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    display_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    phone_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    auth_provider: Mapped[str] = mapped_column(String(32), default="mobile")
+
+
+class SavedRoute(Base):
+    __tablename__ = "saved_routes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    origin_name: Mapped[str] = mapped_column(String(255))
+    destination_name: Mapped[str] = mapped_column(String(255))
+    distance_km: Mapped[float] = mapped_column(Float, default=0.0)
+    duration_minutes: Mapped[float] = mapped_column(Float, default=0.0)
+    safety_score: Mapped[float] = mapped_column(Float, default=0.0)
+    route_type: Mapped[str] = mapped_column(String(32), default="fastest")
+    provider: Mapped[str] = mapped_column(String(32), default="safepath")
+    is_saved: Mapped[bool] = mapped_column(Boolean, default=True)

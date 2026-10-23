@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class Severity(str, Enum):
@@ -24,12 +24,14 @@ class LatLng(BaseModel):
 
 
 # ---------- SOS ----------
-class SOSCreate(LatLng):
+class SOSCreate(BaseModel):
+    lat: float = Field(ge=-90, le=90, validation_alias=AliasChoices("lat", "latitude"))
+    lng: float = Field(ge=-180, le=180, validation_alias=AliasChoices("lng", "longitude"))
     user_id: str | None = None
     incident_type: IncidentType | None = None
     severity: Severity = Severity.high
     message: str | None = Field(default=None, max_length=1000)
-
+    trigger: str | None = None  # "manual" | "accident" (sent by the mobile app)
 
 class NotifiedUnit(BaseModel):
     unit_id: str
