@@ -1,5 +1,6 @@
 import LiveMap from './LiveMap';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import type { Screen } from './src/navigation/routes';
 import {
   ActivityIndicator,
   Alert,
@@ -34,10 +35,6 @@ const C = {
 };
 
 /* ───────────────────────── Types ───────────────────────── */
-type Screen =
-  | 'splash' | 'login' | 'home' | 'navigate' | 'navigate2' | 'trip' | 'sos' | 'comm'
-  | 'nearby' | 'offline' | 'route' | 'profile' | 'accident' | 'community' | 'settings' | 'emergency';
-
 type User = { id: string; email: string; display_name?: string | null; phone_number?: string | null };
 type ApiOptions = { method?: string; body?: unknown };
 
@@ -907,7 +904,7 @@ export default function App() {
   return (
     <View style={[s.outer, isDanger && { backgroundColor: '#1D1426' }]}>
     <SafeAreaView style={[s.safe, s.phone, isDanger && { backgroundColor: '#1D1426' }]}>
-      <StatusBar barStyle="light-content" backgroundColor={isDanger ? '#1D1426' : C.bg} />
+      <StatusBar barStyle="light-content" />
       {showHeader ? (
         <View style={s.header}>
           <Pressable onPress={back} hitSlop={12}><Text style={s.backArrow}>←</Text></Pressable>

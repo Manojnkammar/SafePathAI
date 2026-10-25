@@ -6,9 +6,16 @@
     "orientation": "portrait",
     "platforms": [
       "android",
-      "ios",
       "web"
     ],
+    "android": {
+      "package": "com.safepathai.mobile",
+      "softwareKeyboardLayoutMode": "pan"
+    },
+    "updates": {
+      "enabled": false,
+      "fallbackToCacheTimeout": 0
+    },
     "entryPoint": "./App.tsx",
     "plugins": [
       "expo-asset"

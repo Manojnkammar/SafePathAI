@@ -456,7 +456,7 @@ export default function LiveMap({
 
 const st = StyleSheet.create({
   box: { minHeight: 300, overflow: 'hidden', borderRadius: 16, backgroundColor: '#0b1220' },
-  web: { ...StyleSheet.absoluteFillObject, backgroundColor: 'transparent' },
+  web: { ...StyleSheet.absoluteFill, backgroundColor: 'transparent' },
   searchRow: { position: 'absolute', top: 10, left: 10, right: 10, flexDirection: 'row', gap: 8 },
   input: {
     flex: 1, backgroundColor: 'rgba(15,23,42,0.92)', color: '#fff', borderRadius: 12,
