@@ -7,6 +7,17 @@ type Pt = { lat: number; lng: number };
 type Hazard = { id: string; incident_type: string; severity: string; lat: number; lng: number; radius_m: number };
 type RawRoute = { points: Pt[]; distance_m: number; duration_s: number };
 
+export type PlannedRoute = {
+  points: Pt[];
+  distanceM: number;
+  durationS: number;
+};
+
+export type RouteSummary = {
+  distanceM: number;
+  durationS: number;
+};
+
 type Props = {
   apiUrl: string;
   style?: ViewStyle;
@@ -14,8 +25,12 @@ type Props = {
   initialCenter?: Pt;
   destination?: Pt | null;
   onDestinationChange?: (p: Pt, name?: string) => void;
+  onRouteSummary?: (summary: RouteSummary | null) => void;
   showSearch?: boolean;
   showRoutePanel?: boolean;
+  plannedRoutes?: PlannedRoute[];
+  plannedWaypoints?: Pt[];
+  selectedRouteIndex?: number;
 };
 
 const BENGALURU: Pt = { lat: 12.9716, lng: 77.5946 };
@@ -113,10 +128,12 @@ function buildHtml(dark: boolean) {
 <style>
 html,body,#map{height:100%;margin:0;background:#0b1220}
 .leaflet-container{font-family:-apple-system,Roboto,sans-serif}
+.leaflet-top.leaflet-left{top:72px}
 .me{width:18px;height:18px;border-radius:50%;background:#3b82f6;border:3px solid #fff;box-shadow:0 0 0 6px rgba(59,130,246,.3)}
 .pin{width:22px;height:22px;border-radius:50% 50% 50% 0;background:#ef4444;border:2px solid #fff;transform:rotate(-45deg)}
+.waypoint{width:26px;height:26px;border-radius:13px;background:#16a34a;border:2px solid #fff;color:#fff;font-weight:700;font-size:12px;line-height:22px;text-align:center;box-shadow:0 1px 5px #000}
 </style></head><body><div id="map"></div><script>
-var map=L.map('map').setView([12.9716,77.5946],13);
+var map=L.map('map',{zoomControl:true,zoomAnimation:true}).setView([12.9716,77.5946],13);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,subdomains:'abcd',attribution:'&copy; OpenStreetMap &copy; CARTO'}).addTo(map);
 var layer=L.layerGroup().addTo(map),userMk=null,centered=false,lastFocus=0,lastKey='';
 var COLORS={low:'#facc15',medium:'#fb923c',high:'#ef4444',critical:'#b91c1c'};
@@ -141,15 +158,23 @@ window.__update=function(s){
     var pl=L.polyline(routes[s.sel].points,{color:'#3b82f6',weight:7}).addTo(layer);
     bounds=pl.getBounds();
   }
-  if(s.dest){
+  if(s.dest&&!(s.waypoints||[]).length){
     L.marker([s.dest.lat,s.dest.lng],{icon:L.divIcon({className:'',html:'<div class="pin"></div>',iconSize:[22,22],iconAnchor:[11,22]})}).addTo(layer);
   }
+  (s.waypoints||[]).forEach(function(p,i){
+    var label=i===0?'A':i===s.waypoints.length-1?'B':String(i);
+    L.marker([p.lat,p.lng],{icon:L.divIcon({className:'',html:'<div class="waypoint">'+label+'</div>',iconSize:[28,28],iconAnchor:[14,14]})}).addTo(layer);
+  });
   if(s.user){
     if(userMk){userMk.setLatLng([s.user.lat,s.user.lng]);}
     else{userMk=L.marker([s.user.lat,s.user.lng],{icon:L.divIcon({className:'',html:'<div class="me"></div>',iconSize:[18,18]})}).addTo(map);}
-    if(!centered){map.setView([s.user.lat,s.user.lng],14);centered=true;}
+    if(!centered){
+      if(!(s.waypoints||[]).length){map.setView([s.user.lat,s.user.lng],14);}
+      centered=true;
+    }
   }
-  var key=routes.length+':'+s.sel+':'+(routes[s.sel]?routes[s.sel].points.length:0);
+  var selected=routes[s.sel],start=selected&&selected.points[0],end=selected&&selected.points[selected.points.length-1];
+  var key=routes.length+':'+s.sel+':'+(selected?selected.points.length:0)+':'+(start?start.join(','):'')+':'+(end?end.join(','):'');
   if(bounds&&key!==lastKey){map.fitBounds(bounds,{padding:[50,50]});}
   lastKey=key;
   if(s.focus!==lastFocus){lastFocus=s.focus;if(s.user){map.setView([s.user.lat,s.user.lng],16);}}
@@ -168,8 +193,12 @@ export default function LiveMap({
   initialCenter = BENGALURU,
   destination = null,
   onDestinationChange,
+  onRouteSummary,
   showSearch = true,
   showRoutePanel = true,
+  plannedRoutes,
+  plannedWaypoints = [],
+  selectedRouteIndex = 0,
 }: Props) {
   const html = useMemo(() => buildHtml(dark), [dark]);
   const webRef = useRef<any>(null);
@@ -230,6 +259,17 @@ export default function LiveMap({
       setRaw([]);
       return;
     }
+    if (plannedRoutes !== undefined) {
+      setRaw(plannedRoutes.map((route) => ({
+        points: route.points,
+        distance_m: route.distanceM,
+        duration_s: route.durationS,
+      })));
+      setSel(selectedRouteIndex);
+      setError('');
+      setBusy(false);
+      return;
+    }
     let cancel = false;
     setBusy(true);
     setError('');
@@ -257,26 +297,36 @@ export default function LiveMap({
     return () => {
       cancel = true;
     };
-  }, [dest?.lat, dest?.lng, originKey, apiUrl]);
+  }, [dest?.lat, dest?.lng, originKey, apiUrl, plannedRoutes, selectedRouteIndex]);
 
   /* score every route against the active hazards; safest first */
   const routes = useMemo(
-    () =>
-      raw
-        .map((r) => {
-          const a = analyse(r.points, hazards);
-          const safety = a.total ? Math.round(100 * (1 - a.exposed / a.total)) : 100;
-          return { ...r, safety, hit: a.hit };
-        })
-        .sort((x, y) => y.safety - x.safety || x.duration_s - y.duration_s),
+    () => raw.map((route) => {
+      const analysis = analyse(route.points, hazards);
+      const safety = analysis.total ? Math.round(100 * (1 - analysis.exposed / analysis.total)) : 100;
+      return { ...route, safety, hit: analysis.hit };
+    }),
     [raw, hazards],
   );
-  const cur = Math.min(sel, Math.max(0, routes.length - 1));
-  const chosen = routes[cur];
+  const displayedRoutes = useMemo(
+    () => plannedRoutes === undefined
+      ? [...routes].sort((x, y) => y.safety - x.safety || x.duration_s - y.duration_s)
+      : routes,
+    [plannedRoutes, routes],
+  );
+  const cur = Math.min(plannedRoutes === undefined ? sel : selectedRouteIndex, Math.max(0, displayedRoutes.length - 1));
+  const chosen = displayedRoutes[cur];
+
+  useEffect(() => {
+    onRouteSummary?.(!busy && chosen ? {
+      distanceM: chosen.distance_m,
+      durationS: chosen.duration_s,
+    } : null);
+  }, [busy, chosen?.distance_m, chosen?.duration_s, onRouteSummary]);
 
   const note = useMemo(() => {
     if (!chosen) return '';
-    const fastest = [...routes].sort((a, b) => a.duration_s - b.duration_s)[0];
+    const fastest = [...displayedRoutes].sort((a, b) => a.duration_s - b.duration_s)[0];
     if (chosen.hit.length === 0) {
       if (fastest !== chosen && fastest.hit.length) {
         const extra = Math.max(0, Math.round((chosen.duration_s - fastest.duration_s) / 60));
@@ -285,7 +335,7 @@ export default function LiveMap({
       return hazards.length ? 'No active hazard zones on this route.' : 'No active hazards reported.';
     }
     return 'Passes through ' + chosen.hit.join(', ') + '. No safer road alternative was found.';
-  }, [chosen, routes, hazards.length]);
+  }, [chosen, displayedRoutes, hazards.length]);
 
   /* send state to the map */
   const mapState = useMemo(
@@ -293,11 +343,12 @@ export default function LiveMap({
       hazards,
       user,
       dest,
-      routes: routes.map((r) => ({ points: r.points.map((p) => [p.lat, p.lng]), safety: r.safety })),
+      routes: displayedRoutes.map((r) => ({ points: r.points.map((p) => [p.lat, p.lng]), safety: r.safety })),
+      waypoints: plannedWaypoints,
       sel: cur,
       focus,
     }),
-    [hazards, user, dest, routes, cur, focus],
+    [hazards, user, dest, displayedRoutes, plannedWaypoints, cur, focus],
   );
   const push = useCallback(() => {
     const json = JSON.stringify(mapState);
@@ -335,7 +386,10 @@ export default function LiveMap({
   async function search() {
     if (!query.trim()) return;
     setBusy(true);
+    setRaw([]);
+    setSel(0);
     setError('');
+    onRouteSummary?.(null);
     try {
       const r = await fetch(
         'https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=in&q=' + encodeURIComponent(query),
@@ -434,7 +488,7 @@ export default function LiveMap({
                 </Pressable>
               </View>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginVertical: 6 }}>
-                {routes.map((r, i) => (
+                {displayedRoutes.map((r, i) => (
                   <Pressable key={i} onPress={() => setSel(i)} style={[st.chip, i === cur && st.chipOn]}>
                     <Text style={[st.chipTxt, i === cur && st.chipTxtOn]}>
                       {(i === 0 ? 'Recommended' : 'Option ' + (i + 1)) + ': ' + fmtDur(r.duration_s)}

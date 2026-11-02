@@ -10,7 +10,13 @@
     ],
     "android": {
       "package": "com.safepathai.mobile",
-      "softwareKeyboardLayoutMode": "pan"
+      "softwareKeyboardLayoutMode": "pan",
+      "permissions": [
+        "CAMERA",
+        "READ_MEDIA_IMAGES",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION"
+      ]
     },
     "updates": {
       "enabled": false,
@@ -18,7 +24,9 @@
     },
     "entryPoint": "./App.tsx",
     "plugins": [
-      "expo-asset"
+      "expo-asset",
+      ["expo-image-picker", { "cameraPermission": "SafePath AI uses the camera to capture road hazard reports." }],
+      ["expo-location", { "locationAlwaysAndWhenInUsePermission": "SafePath AI uses your location to place hazard reports and calculate routes." }]
     ]
   }
 }

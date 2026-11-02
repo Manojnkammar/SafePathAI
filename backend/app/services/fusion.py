@@ -41,7 +41,9 @@ async def active_hazards(session: AsyncSession) -> list[HazardOut]:
     rep_rows = await session.scalars(
         select(CommunityReport).where(
             CommunityReport.validated.is_(True),
+            CommunityReport.resolved.is_(False),
             CommunityReport.created_at >= cutoff,
+            (CommunityReport.expires_at.is_(None)) | (CommunityReport.expires_at > utcnow()),
         )
     )
     for r in rep_rows:

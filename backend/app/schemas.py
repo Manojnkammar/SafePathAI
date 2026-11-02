@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 
 class Severity(str, Enum):
@@ -13,6 +13,16 @@ class Severity(str, Enum):
 
 class IncidentType(str, Enum):
     accident = "accident"
+    flood = "flood"
+    fire = "fire"
+    blockage = "blockage"
+
+
+class ReportIncidentType(str, Enum):
+    pothole = "pothole"
+    traffic_jam = "traffic_jam"
+    accident = "accident"
+    flooded_road = "flooded_road"
     flood = "flood"
     fire = "fire"
     blockage = "blockage"
@@ -87,10 +97,11 @@ class IncidentOut(BaseModel):
 # ---------- Community reports ----------
 class ReportCreate(LatLng):
     user_id: str | None = None
-    incident_type: IncidentType
+    incident_type: ReportIncidentType
     severity: Severity = Severity.medium
     description: str | None = Field(default=None, max_length=1000)
     media_url: str | None = None
+    expires_at: datetime | None = None
 
 
 class ReportOut(BaseModel):
@@ -107,6 +118,20 @@ class ReportOut(BaseModel):
     credibility: float
     validated: bool
     credibility_reasons: list[str]
+    resolved: bool = False
+    expires_at: datetime | None = None
+    verification_status: str = "pending"
+    upvotes: int = 0
+    downvotes: int = 0
+
+
+class ReportVote(BaseModel):
+    user_id: str | None = None
+    vote: str = Field(pattern="^(up|down)$")
+
+
+class ReportResolve(BaseModel):
+    resolved: bool = True
 
 
 # ---------- Hazards ----------
@@ -144,6 +169,75 @@ class RouteResponse(BaseModel):
     baseline_eta_s: int
     baseline_hazards: list[str]
     routes: list[RouteOption]
+
+
+class TripVehicle(str, Enum):
+    bike = "bike"
+    car = "car"
+    ev = "ev"
+    bus = "bus"
+
+
+class TripPreference(str, Enum):
+    best = "best"
+    safest = "safest"
+    fuel_saver = "fuel_saver"
+    less_traffic = "less_traffic"
+
+
+class TripPlace(LatLng):
+    name: str = Field(min_length=1, max_length=255)
+
+
+class TripPlanRequest(BaseModel):
+    origin: TripPlace
+    destination: TripPlace
+    stops: list[TripPlace] = Field(default_factory=list)
+    vehicle_type: TripVehicle
+    preference: TripPreference
+
+    @model_validator(mode="after")
+    def validate_trip_locations(self):
+        places = [self.origin, *self.stops, self.destination]
+        coordinates = [(place.lat, place.lng) for place in places]
+        if len(set(coordinates)) != len(coordinates):
+            raise ValueError("Trip locations must not repeat the same coordinates.")
+        return self
+
+
+class PlaceSuggestion(LatLng):
+    name: str = Field(min_length=1, max_length=255)
+
+
+class TripLeg(BaseModel):
+    origin_name: str
+    destination_name: str
+    distance_m: float
+    duration_s: float
+
+
+class TripRouteOption(BaseModel):
+    rank: int
+    points: list[LatLng]
+    legs: list[TripLeg]
+    distance_m: float
+    duration_s: float
+    safety_score: int | None
+    fuel_litres: float | None = None
+    energy_kwh: float | None = None
+    estimated_cost: float | None = None
+    explanation: str
+
+
+class TripPlanResponse(BaseModel):
+    provider: str
+    active_hazards: int
+    vehicle_type: TripVehicle
+    preference: TripPreference
+    traffic_data_available: bool
+    routes: list[TripRouteOption]
+    ranking_note: str
+    estimation_note: str
 
 
 # ---------- Advisory ----------

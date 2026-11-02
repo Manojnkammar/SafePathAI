@@ -1,10 +1,27 @@
-import LiveMap from './LiveMap';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import LiveMap, { PlannedRoute, RouteSummary } from './LiveMap';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Battery from 'expo-battery';
+import Constants from 'expo-constants';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import * as ImagePicker from 'expo-image-picker';
+import * as Location from 'expo-location';
 import type { Screen } from './src/navigation/routes';
+import {
+  addNearbyBluetoothListener,
+  nearbyBluetooth,
+  requestNearbyBluetoothPermissions,
+  type BlePeerConnection,
+  type BleReceivedMessage,
+  type NearbyBlePeer,
+} from './src/services/nearbyBluetooth';
 import {
   ActivityIndicator,
   Alert,
+  Image,
+  Modal,
+  Platform,
   Pressable,
+  RefreshControl,
   SafeAreaView,
   ScrollView,
   StatusBar,
@@ -36,9 +53,72 @@ const C = {
 
 /* ───────────────────────── Types ───────────────────────── */
 type User = { id: string; email: string; display_name?: string | null; phone_number?: string | null };
+type EmergencyContact = { id: string; name: string; phone: string };
+type SavedPlace = { name: string; lat: number; lng: number };
+type SavedBlePeer = NearbyBlePeer & { connected: boolean };
 type ApiOptions = { method?: string; body?: unknown };
+type CommunityReport = {
+  id: number;
+  created_at: string;
+  incident_type: string;
+  severity: string;
+  lat: number;
+  lng: number;
+  description: string | null;
+  media_url: string | null;
+  credibility: number;
+  validated: boolean;
+  upvotes: number;
+  downvotes: number;
+};
+type ReportType = 'pothole' | 'traffic_jam' | 'accident' | 'flooded_road';
+type TripVehicle = 'bike' | 'car' | 'ev' | 'bus';
+type TripPreference = 'best' | 'safest' | 'fuel_saver' | 'less_traffic';
+type TripPlace = { name: string; lat: number; lng: number };
+type TripStop = { id: number; place: TripPlace | null };
+type TripLeg = { origin_name: string; destination_name: string; distance_m: number; duration_s: number };
+type TripRoute = {
+  rank: number;
+  points: { lat: number; lng: number }[];
+  legs: TripLeg[];
+  distance_m: number;
+  duration_s: number;
+  safety_score: number | null;
+  fuel_litres: number | null;
+  energy_kwh: number | null;
+  estimated_cost: number | null;
+  explanation: string;
+};
+type TripPlan = {
+  provider: string;
+  active_hazards: number;
+  vehicle_type: TripVehicle;
+  preference: TripPreference;
+  traffic_data_available: boolean;
+  routes: TripRoute[];
+  ranking_note: string;
+  estimation_note: string;
+};
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:8000/api/v1';
+let nextTripStopId = 0;
+
+const expoHost = Constants.expoConfig?.hostUri?.split(':')[0];
+const developmentHost = expoHost && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(expoHost)
+  ? expoHost
+  : Platform.OS === 'android' ? '10.0.2.2' : 'localhost';
+const API_URL = process.env.EXPO_PUBLIC_API_URL ?? `http://${developmentHost}:8000/api/v1`;
+const SAVED_BLE_PEERS_KEY = 'safepath-nearby-bluetooth-peers';
+const SAVED_PLACES_KEY = 'safepath-saved-places';
+const MAX_SAVED_BLE_PEERS = 5;
+
+function isSavedBlePeer(value: unknown): value is SavedBlePeer {
+  if (!value || typeof value !== 'object') return false;
+  const peer = value as Record<string, unknown>;
+  return typeof peer.id === 'string'
+    && typeof peer.name === 'string'
+    && Number.isFinite(peer.rssi)
+    && typeof peer.connected === 'boolean';
+}
 
 async function api<T>(path: string, options: ApiOptions = {}): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
@@ -51,6 +131,15 @@ async function api<T>(path: string, options: ApiOptions = {}): Promise<T> {
     throw new Error(detail || `Request failed (${response.status})`);
   }
   return response.json() as Promise<T>;
+}
+
+function formatTripDistance(distanceM: number) {
+  return distanceM >= 1000 ? `${(distanceM / 1000).toFixed(1)} km` : `${Math.round(distanceM)} m`;
+}
+
+function formatTripDuration(durationS: number) {
+  const minutes = Math.max(1, Math.round(durationS / 60));
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes} min`;
 }
 
 const TABS: { key: Screen; label: string; icon: string }[] = [
@@ -90,9 +179,9 @@ function Btn({ title, onPress, outline, danger, pill, disabled, small }: {
   );
 }
 
-function Field({ label, value, onChangeText, placeholder, secure, keyboardType, icon }: {
+function Field({ label, value, onChangeText, placeholder, secure, keyboardType, icon, maxLength }: {
   label?: string; value: string; onChangeText?: (v: string) => void; placeholder?: string;
-  secure?: boolean; keyboardType?: 'default' | 'email-address' | 'phone-pad'; icon?: string;
+  secure?: boolean; keyboardType?: 'default' | 'email-address' | 'phone-pad'; icon?: string; maxLength?: number;
 }) {
   return (
     <View style={{ marginTop: 12 }}>
@@ -106,6 +195,7 @@ function Field({ label, value, onChangeText, placeholder, secure, keyboardType, 
           placeholderTextColor={C.muted}
           secureTextEntry={secure}
           keyboardType={keyboardType}
+          maxLength={maxLength}
           autoCapitalize="none"
           style={s.input}
         />
@@ -141,6 +231,77 @@ function Chip({ label, active, onPress, icon }: { label: string; active?: boolea
 
 function Section({ children }: { children: React.ReactNode }) {
   return <Text style={s.section}>{children}</Text>;
+}
+
+function TripPlaceField({ label, value, onChange }: {
+  label: string;
+  value: TripPlace | null;
+  onChange: (place: TripPlace | null) => void;
+}) {
+  const [query, setQuery] = useState(value?.name ?? '');
+  const [suggestions, setSuggestions] = useState<TripPlace[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  async function searchPlaces() {
+    if (query.trim().length < 2) {
+      setError('Enter at least 2 characters to search.');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    setSuggestions([]);
+    try {
+      const results = await api<TripPlace[]>(`/routes/places/search?q=${encodeURIComponent(query.trim())}`);
+      setSuggestions(results);
+      if (results.length === 0) setError('No matching places found.');
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Place search failed.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <View style={{ marginTop: 12 }}>
+      <Text style={s.label}>{label}</Text>
+      <View style={s.inputWrap}>
+        <TextInput
+          value={query}
+          onChangeText={(text) => {
+            setQuery(text);
+            setSuggestions([]);
+            setError('');
+            onChange(null);
+          }}
+          placeholder="Search a place"
+          placeholderTextColor={C.muted}
+          style={s.input}
+          returnKeyType="search"
+          onSubmitEditing={searchPlaces}
+        />
+        <Pressable onPress={searchPlaces} disabled={loading} accessibilityRole="button">
+          {loading ? <ActivityIndicator color={C.blueLight} /> : <Text style={{ color: C.blueLight, fontWeight: '700' }}>Search</Text>}
+        </Pressable>
+      </View>
+      {value ? <Text style={s.mini}>Selected: {value.name}</Text> : null}
+      {suggestions.map((place, index) => (
+        <Pressable
+          key={`${place.lat},${place.lng},${index}`}
+          style={s.placeSuggestion}
+          onPress={() => {
+            setQuery(place.name);
+            setSuggestions([]);
+            setError('');
+            onChange(place);
+          }}
+        >
+          <Text style={s.white12}>{place.name}</Text>
+        </Pressable>
+      ))}
+      {error ? <Text style={{ color: C.orange, fontSize: 12, marginTop: 6 }}>{error}</Text> : null}
+    </View>
+  );
 }
 
 /* ───────────────────────── Stylised map ───────────────────────── */
@@ -213,36 +374,503 @@ export default function App() {
 
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(false);
+  const [vehicleNumber, setVehicleNumber] = useState('');
+  const [vehicleNumberDraft, setVehicleNumberDraft] = useState('');
+  const [vehicleNumberLoading, setVehicleNumberLoading] = useState(true);
+  const [vehicleEditorOpen, setVehicleEditorOpen] = useState(false);
+  const [savedPlaces, setSavedPlaces] = useState<SavedPlace[]>([]);
+  const [savedPlacesLoading, setSavedPlacesLoading] = useState(true);
+  const [batteryLevel, setBatteryLevel] = useState<number | null>(null);
+  const [batteryLoading, setBatteryLoading] = useState(true);
+  const [emergencyContacts, setEmergencyContacts] = useState<EmergencyContact[]>([]);
+  const [contactNameDraft, setContactNameDraft] = useState('');
+  const [contactPhoneDraft, setContactPhoneDraft] = useState('');
+  const [contactEditorOpen, setContactEditorOpen] = useState(false);
+  const [contactsLoading, setContactsLoading] = useState(true);
+  const [savedBlePeers, setSavedBlePeers] = useState<SavedBlePeer[]>([]);
+  const savedBlePeersRef = useRef<SavedBlePeer[]>([]);
+  const [savedBlePeersLoaded, setSavedBlePeersLoaded] = useState(false);
+  const nearbyBlePeersRef = useRef<NearbyBlePeer[]>([]);
+  const pendingBlePeerIdsRef = useRef<Set<string>>(new Set());
+  const [nearbyBlePeers, setNearbyBlePeers] = useState<NearbyBlePeer[]>([]);
+  const [bleStatus, setBleStatus] = useState<'idle' | 'starting' | 'ready' | 'error'>('idle');
+  const [bleError, setBleError] = useState('');
+  const [peerPickerOpen, setPeerPickerOpen] = useState(false);
+  const [bleScanning, setBleScanning] = useState(false);
+  const [broadcastModalOpen, setBroadcastModalOpen] = useState(false);
+  const [broadcastDraft, setBroadcastDraft] = useState('');
+  const [broadcastSending, setBroadcastSending] = useState(false);
 
   // form state
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [passwordConfirmation, setPasswordConfirmation] = useState('');
   const [name, setName] = useState('Rohan Kumar');
   const [phone, setPhone] = useState('+91 98765 43210');
+  const [signUpMode, setSignUpMode] = useState(false);
   const [search, setSearch] = useState('');
 
   // trip state
-  const [stops, setStops] = useState(['Bangalore, Karnataka', 'Ramanagara', 'Mandya', 'Mysuru, Karnataka']);
-  const [vehicle, setVehicle] = useState('Car');
-  const [routePref, setRoutePref] = useState('Safest');
+  const [tripOrigin, setTripOrigin] = useState<TripPlace | null>(null);
+  const [tripDestination, setTripDestination] = useState<TripPlace | null>(null);
+  const [tripStops, setTripStops] = useState<TripStop[]>([]);
+  const [vehicle, setVehicle] = useState<TripVehicle | null>(null);
+  const [routePref, setRoutePref] = useState<TripPreference>('best');
+  const [tripPlan, setTripPlan] = useState<TripPlan | null>(null);
+  const [tripRouteIndex, setTripRouteIndex] = useState(0);
+  const [tripLoading, setTripLoading] = useState(false);
+  const [tripError, setTripError] = useState('');
 
   // misc ui state
   const [routeTab, setRouteTab] = useState('Overview');
   const [reportFilter, setReportFilter] = useState('All');
+  const [communityReports, setCommunityReports] = useState<CommunityReport[]>([]);
+  const [communityLoading, setCommunityLoading] = useState(false);
+  const [communityError, setCommunityError] = useState('');
+  const [reportFormOpen, setReportFormOpen] = useState(false);
+  const [reportType, setReportType] = useState<ReportType>('pothole');
+  const [reportDescription, setReportDescription] = useState('');
+  const [reportPhotoUri, setReportPhotoUri] = useState<string | null>(null);
+  const [reportLocation, setReportLocation] = useState<{ lat: number; lng: number } | null>(null);
+  const [reportSubmitting, setReportSubmitting] = useState(false);
   const [foodFilter, setFoodFilter] = useState<'Veg' | 'Non-Veg'>('Veg');
   const [darkMode, setDarkMode] = useState<'Off' | 'On' | 'System'>('System');
   const [shareInfo, setShareInfo] = useState(true);
   const [bloodGroup, setBloodGroup] = useState('');
   const [notes, setNotes] = useState('Allergic to peanuts\nAsthma');
-  const [countdown, setCountdown] = useState(5);
+  const [countdown, setCountdown] = useState(10);
   const [dl, setDl] = useState(45);
+  const [routeSummary, setRouteSummary] = useState<RouteSummary | null>(null);
 
-  const destination = stops[stops.length - 1];
+  useEffect(() => {
+    AsyncStorage.getItem('safepath-vehicle-number')
+      .then((savedNumber) => {
+        if (savedNumber) setVehicleNumber(savedNumber);
+      })
+      .catch((error) => {
+        Alert.alert('Vehicle details unavailable', error instanceof Error ? error.message : 'Could not load the saved vehicle number.');
+      })
+      .finally(() => setVehicleNumberLoading(false));
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem('safepath-emergency-contacts')
+      .then((savedContacts) => {
+        if (!savedContacts) return;
+        const parsed: unknown = JSON.parse(savedContacts);
+        if (!Array.isArray(parsed) || !parsed.every((item) =>
+          item && typeof item.id === 'string' && typeof item.name === 'string' && typeof item.phone === 'string'
+        )) {
+          throw new Error('Saved emergency contacts have an invalid format.');
+        }
+        setEmergencyContacts(parsed as EmergencyContact[]);
+      })
+      .catch((error) => {
+        Alert.alert('Emergency contacts unavailable', error instanceof Error ? error.message : 'Could not load saved contacts.');
+      })
+      .finally(() => setContactsLoading(false));
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem(SAVED_PLACES_KEY)
+      .then((savedPlacesJson) => {
+        if (!savedPlacesJson) return;
+        const parsed: unknown = JSON.parse(savedPlacesJson);
+        if (!Array.isArray(parsed) || !parsed.every(isSavedPlace)) {
+          throw new Error('Saved places have an invalid format.');
+        }
+        setSavedPlaces(parsed);
+      })
+      .catch((error) => {
+        Alert.alert('Saved places unavailable', error instanceof Error ? error.message : 'Could not load saved places.');
+      })
+      .finally(() => setSavedPlacesLoading(false));
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem(SAVED_BLE_PEERS_KEY)
+      .then((savedPeers) => {
+        if (!savedPeers) return;
+        const parsed: unknown = JSON.parse(savedPeers);
+        if (!Array.isArray(parsed) || !parsed.every(isSavedBlePeer)) {
+          throw new Error('Saved Bluetooth connections have an invalid format.');
+        }
+        const peers = parsed.slice(0, MAX_SAVED_BLE_PEERS);
+        savedBlePeersRef.current = peers;
+        setSavedBlePeers(peers);
+      })
+      .catch((error) => {
+        Alert.alert('Bluetooth connections unavailable', error instanceof Error ? error.message : 'Could not load saved devices.');
+      })
+      .finally(() => setSavedBlePeersLoaded(true));
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let subscription: Battery.Subscription | undefined;
+
+    async function readBatteryLevel() {
+      try {
+        const available = await Battery.isAvailableAsync();
+        if (!active) return;
+        if (!available) {
+          setBatteryLevel(null);
+          return;
+        }
+
+        const level = await Battery.getBatteryLevelAsync();
+        if (!active) return;
+        setBatteryLevel(level >= 0 ? Math.round(level * 100) : null);
+        subscription = Battery.addBatteryLevelListener(({ batteryLevel: updatedLevel }) => {
+          if (active) setBatteryLevel(updatedLevel >= 0 ? Math.round(updatedLevel * 100) : null);
+        });
+      } catch (error) {
+        if (!active) return;
+        setBatteryLevel(null);
+        Alert.alert('Battery level unavailable', error instanceof Error ? error.message : 'Could not read the device battery level.');
+      } finally {
+        if (active) setBatteryLoading(false);
+      }
+    }
+
+    void readBatteryLevel();
+    return () => {
+      active = false;
+      subscription?.remove();
+    };
+  }, []);
+
+  const selectedTripRoute = tripPlan?.routes[tripRouteIndex] ?? tripPlan?.routes[0] ?? null;
+  const tripMapRoutes = useMemo<PlannedRoute[]>(
+    () => tripPlan?.routes.map((route) => ({
+      points: route.points,
+      distanceM: route.distance_m,
+      durationS: route.duration_s,
+    })) ?? [],
+    [tripPlan],
+  );
+  const tripMapWaypoints = useMemo(
+    () => tripOrigin && tripDestination
+      ? [tripOrigin, ...tripStops.flatMap((stop) => stop.place ? [stop.place] : []), tripDestination]
+          .map(({ lat, lng }) => ({ lat, lng }))
+      : [],
+    [tripOrigin, tripStops, tripDestination],
+  );
 
   /* navigation helpers */
   const go = useCallback((next: Screen) => setStack((st) => [...st, next]), []);
   const back = useCallback(() => setStack((st) => (st.length > 1 ? st.slice(0, -1) : st)), []);
   const tab = useCallback((next: Screen) => setStack(['home'].concat(next === 'home' ? [] : [next]) as Screen[]), []);
+
+  async function persistSavedBlePeers(peers: SavedBlePeer[]) {
+    const limitedPeers = peers.slice(0, MAX_SAVED_BLE_PEERS);
+    await AsyncStorage.setItem(SAVED_BLE_PEERS_KEY, JSON.stringify(limitedPeers));
+    savedBlePeersRef.current = limitedPeers;
+    setSavedBlePeers(limitedPeers);
+  }
+
+  async function scanForBluetoothPeers() {
+    if (savedBlePeers.length >= MAX_SAVED_BLE_PEERS) {
+      Alert.alert('Connection limit reached', `You can connect up to ${MAX_SAVED_BLE_PEERS} nearby devices.`);
+      return;
+    }
+    setBleError('');
+    setNearbyBlePeers([]);
+    setBleScanning(true);
+    try {
+      await requestNearbyBluetoothPermissions();
+      await nearbyBluetooth.startScan(12_000);
+      setTimeout(() => setBleScanning(false), 12_000);
+    } catch (error) {
+      setBleScanning(false);
+      setBleError(error instanceof Error ? error.message : 'Bluetooth scan could not be started.');
+    }
+  }
+
+  async function connectToBluetoothPeer(peer: NearbyBlePeer) {
+    if (savedBlePeers.some((savedPeer) => savedPeer.id === peer.id)) return;
+    if (savedBlePeers.length + pendingBlePeerIdsRef.current.size >= MAX_SAVED_BLE_PEERS) {
+      Alert.alert('Connection limit reached', `You can connect up to ${MAX_SAVED_BLE_PEERS} nearby devices.`);
+      return;
+    }
+    try {
+      pendingBlePeerIdsRef.current.add(peer.id);
+      await nearbyBluetooth.connect(peer.id);
+    } catch (error) {
+      pendingBlePeerIdsRef.current.delete(peer.id);
+      setBleError(error instanceof Error ? error.message : 'Could not connect to that device.');
+    }
+  }
+
+  async function removeBluetoothPeer(peerId: string) {
+    try {
+      await nearbyBluetooth.disconnect(peerId);
+      await persistSavedBlePeers(savedBlePeersRef.current.filter((peer) => peer.id !== peerId));
+    } catch (error) {
+      setBleError(error instanceof Error ? error.message : 'Could not remove that Bluetooth device.');
+    }
+  }
+
+  async function sendBroadcastMessage() {
+    const message = broadcastDraft.trim();
+    const connectedPeers = savedBlePeers.filter((peer) => peer.connected);
+    if (!message) {
+      Alert.alert('Message required', 'Type a short message asking for help.');
+      return;
+    }
+
+    useEffect(() => {
+      if (screen !== 'comm') return;
+      if (!savedBlePeersLoaded) return;
+      let active = true;
+      let subscriptions: { remove: () => void }[] = [];
+
+      const startCommunication = async () => {
+        setBleStatus('starting');
+        setBleError('');
+        try {
+          await requestNearbyBluetoothPermissions();
+          if (!active) return;
+          subscriptions = [
+            addNearbyBluetoothListener('onBluetoothStatus', (status) => {
+              if (status.ready) {
+                setBleStatus('ready');
+                setBleError('');
+              } else {
+                setBleStatus('error');
+                setBleError(status.error ?? 'Bluetooth advertising failed.');
+              }
+            }),
+            addNearbyBluetoothListener('onPeerFound', (peer) => {
+              setNearbyBlePeers((currentPeers) => {
+                const nextPeers = currentPeers.filter((currentPeer) => currentPeer.id !== peer.id);
+                const sortedPeers = [...nextPeers, peer].sort((a, b) => b.rssi - a.rssi);
+                nearbyBlePeersRef.current = sortedPeers;
+                return sortedPeers;
+              });
+            }),
+            addNearbyBluetoothListener('onPeerConnection', (connection: BlePeerConnection & { error?: string; name?: string }) => {
+              if (connection.error) {
+                setBleError(`Bluetooth error: ${connection.error}`);
+                return;
+              }
+              const existing = savedBlePeersRef.current;
+              const pending = pendingBlePeerIdsRef.current.has(connection.id);
+              const existingPeer = existing.find((peer) => peer.id === connection.id);
+              if (!connection.connected) {
+                if (existingPeer) {
+                  void persistSavedBlePeers(existing.map((peer) =>
+                    peer.id === connection.id ? { ...peer, connected: false } : peer
+                  )).catch((error) => {
+                    setBleError(error instanceof Error ? error.message : 'Could not update the Bluetooth connection.');
+                  });
+                } else if (pending) {
+                  pendingBlePeerIdsRef.current.delete(connection.id);
+                  setBleError('Bluetooth connection failed. Check that the other device is still available.');
+                }
+                return;
+              }
+              if (!existingPeer && !pending) return;
+              const discovered = nearbyBlePeersRef.current.find((peer) => peer.id === connection.id);
+              const updatedPeer: SavedBlePeer = {
+                id: connection.id,
+                name: connection.name ?? discovered?.name ?? existingPeer?.name ?? 'SafePath device',
+                rssi: discovered?.rssi ?? existingPeer?.rssi ?? -100,
+                connected: true,
+              };
+              const nextPeers = existingPeer
+                ? existing.map((peer) => peer.id === connection.id ? updatedPeer : peer)
+                : [...existing, updatedPeer].slice(0, MAX_SAVED_BLE_PEERS);
+              pendingBlePeerIdsRef.current.delete(connection.id);
+              void persistSavedBlePeers(nextPeers).catch((error) => {
+                setBleError(error instanceof Error ? error.message : 'Could not save this Bluetooth connection.');
+              });
+              if (connection.connected && pending) setPeerPickerOpen(false);
+            }),
+            addNearbyBluetoothListener('onMessageReceived', (message: BleReceivedMessage) => {
+              const peer = savedBlePeersRef.current.find((savedPeer) => savedPeer.id === message.id);
+              Alert.alert(`Help message${peer ? ` from ${peer.name}` : ''}`, message.text);
+            }),
+          ];
+          await nearbyBluetooth.start(user?.display_name ?? name);
+          if (!active) {
+            await nearbyBluetooth.stop();
+            return;
+          }
+          for (const peer of savedBlePeersRef.current) {
+            try {
+              await nearbyBluetooth.connect(peer.id);
+            } catch (error) {
+              setBleError(error instanceof Error ? error.message : `Could not reconnect to ${peer.name}.`);
+            }
+          }
+        } catch (error) {
+          if (active) {
+            setBleStatus('error');
+            setBleError(error instanceof Error ? error.message : 'Bluetooth communication could not be started.');
+          }
+        }
+      };
+
+      void startCommunication();
+      return () => {
+        active = false;
+        subscriptions.forEach((subscription) => subscription.remove());
+        if (Platform.OS === 'android') {
+          void nearbyBluetooth.stop().catch(() => {
+            setBleError('Bluetooth could not be stopped cleanly.');
+          });
+        }
+        pendingBlePeerIdsRef.current.clear();
+        nearbyBlePeersRef.current = [];
+        setNearbyBlePeers([]);
+        setBleScanning(false);
+        const disconnectedPeers = savedBlePeersRef.current.map((peer) => ({ ...peer, connected: false }));
+        savedBlePeersRef.current = disconnectedPeers;
+        setSavedBlePeers(disconnectedPeers);
+      };
+    }, [screen, savedBlePeersLoaded]);
+    if (connectedPeers.length === 0) {
+      Alert.alert('No connected devices', 'Connect to nearby SafePath devices before broadcasting a message.');
+      return;
+    }
+    setBroadcastSending(true);
+    const results = await Promise.allSettled(
+      connectedPeers.map((peer) => Promise.resolve().then(() => nearbyBluetooth.sendMessage(peer.id, message))),
+    );
+    setBroadcastSending(false);
+    const sentCount = results.filter((result) => result.status === 'fulfilled').length;
+    const failedCount = results.length - sentCount;
+    setBroadcastModalOpen(false);
+    setBroadcastDraft('');
+    if (failedCount === 0) {
+      Alert.alert('Message delivered', `Your message was delivered to ${sentCount} connected SafePath device${sentCount === 1 ? '' : 's'}.`);
+    } else {
+      Alert.alert('Some messages were not delivered', `Delivered to ${sentCount}; failed for ${failedCount}.`);
+    }
+  }
+
+  function clearTripResult() {
+    setTripPlan(null);
+    setTripRouteIndex(0);
+    setTripError('');
+  }
+
+  function openVehicleEditor() {
+    setVehicleNumberDraft(vehicleNumber);
+    setVehicleEditorOpen(true);
+  }
+
+  async function saveVehicleNumber() {
+    const number = vehicleNumberDraft.trim();
+    if (!number) {
+      Alert.alert('Vehicle number required', 'Enter a vehicle registration number to save.');
+      return;
+    }
+    if (number.length > 20) {
+      Alert.alert('Vehicle number too long', 'Vehicle registration numbers must be 20 characters or fewer.');
+      return;
+    }
+    try {
+      await AsyncStorage.setItem('safepath-vehicle-number', number);
+      setVehicleNumber(number);
+      setVehicleEditorOpen(false);
+    } catch (error) {
+      Alert.alert('Could not save vehicle number', error instanceof Error ? error.message : 'Please try again.');
+    }
+  }
+
+  function openContactEditor() {
+    setContactNameDraft('');
+    setContactPhoneDraft('');
+    setContactEditorOpen(true);
+  }
+
+  async function saveEmergencyContact() {
+    const contactName = contactNameDraft.trim();
+    const contactPhone = contactPhoneDraft.trim();
+    const phoneDigits = contactPhone.replace(/\D/g, '');
+    if (!contactName) {
+      Alert.alert('Name required', 'Enter the contact’s name.');
+      return;
+    }
+    if (phoneDigits.length < 7 || phoneDigits.length > 15) {
+      Alert.alert('Valid phone number required', 'Enter a phone number containing 7 to 15 digits.');
+      return;
+    }
+
+    const updatedContacts = [
+      ...emergencyContacts,
+      { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, name: contactName, phone: contactPhone },
+    ];
+    try {
+      await AsyncStorage.setItem('safepath-emergency-contacts', JSON.stringify(updatedContacts));
+      setEmergencyContacts(updatedContacts);
+      setContactEditorOpen(false);
+    } catch (error) {
+      Alert.alert('Could not save contact', error instanceof Error ? error.message : 'Please try again.');
+    }
+  }
+
+  async function removeEmergencyContact(contactId: string) {
+    const updatedContacts = emergencyContacts.filter((contact) => contact.id !== contactId);
+    try {
+      await AsyncStorage.setItem('safepath-emergency-contacts', JSON.stringify(updatedContacts));
+      setEmergencyContacts(updatedContacts);
+    } catch (error) {
+      Alert.alert('Could not remove contact', error instanceof Error ? error.message : 'Please try again.');
+    }
+  }
+
+  async function generateTrip() {
+    clearTripResult();
+    if (!tripOrigin) {
+      setTripError('Search for and select a starting point.');
+      return;
+    }
+    if (!tripDestination) {
+      setTripError('Search for and select a destination.');
+      return;
+    }
+    if (!vehicle) {
+      setTripError('Select a vehicle type before generating a route.');
+      return;
+    }
+    const orderedStops: TripPlace[] = [];
+    for (const stop of tripStops) {
+      if (!stop.place) {
+        setTripError('Search for and select a location for every stop, or remove the empty stop.');
+        return;
+      }
+      orderedStops.push(stop.place);
+    }
+    const locations = [tripOrigin, ...orderedStops, tripDestination];
+    if (new Set(locations.map((place) => `${place.lat},${place.lng}`)).size !== locations.length) {
+      setTripError('Choose a different location for each point in the trip.');
+      return;
+    }
+
+    setTripLoading(true);
+    try {
+      const result = await api<TripPlan>('/routes/plan', {
+        method: 'POST',
+        body: {
+          origin: tripOrigin,
+          destination: tripDestination,
+          stops: orderedStops,
+          vehicle_type: vehicle,
+          preference: routePref,
+        },
+      });
+      if (result.routes.length === 0) throw new Error('The routing service returned no route options.');
+      setTripPlan(result);
+      setTripRouteIndex(0);
+    } catch (error) {
+      setTripError(error instanceof Error ? error.message : 'Could not generate this trip.');
+    } finally {
+      setTripLoading(false);
+    }
+  }
 
   /* splash → login */
   useEffect(() => {
@@ -253,21 +881,16 @@ export default function App() {
 
   /* API actions */
   async function login() {
-    if (!email.trim()) {
-      Alert.alert('Missing details', 'Enter your email or phone to continue.');
+    if (!email.trim() || !password) {
+      Alert.alert('Missing details', 'Enter your email and password to continue.');
       return;
     }
     setLoading(true);
     try {
-      let u: User;
-      try {
-        u = await api<User>(`/users/by-email?email=${encodeURIComponent(email)}`);
-      } catch {
-        u = await api<User>('/users', {
-          method: 'POST',
-          body: { email, display_name: name, phone_number: phone, auth_provider: 'mobile' },
-        });
-      }
+      const u = await api<User>('/users/login', {
+        method: 'POST',
+        body: { email: email.trim(), password },
+      });
       setUser(u);
       setStack(['home']);
     } catch (e) {
@@ -277,9 +900,141 @@ export default function App() {
     }
   }
 
+  async function signUp() {
+    if (!name.trim() || !email.trim()) {
+      Alert.alert('Missing details', 'Enter your name and email to create an account.');
+      return;
+    }
+    const commonPasswords = new Set(['123!', '12345678', 'password', 'password1!', 'password123!', '12345678aa!', '123456789aa!', 'qwerty123!', 'letmein1!', 'admin123!', 'welcome1!', 'iloveyou1!', 'abc12345!', 'changeme1!', 'passw0rd!', 'monkey123!', 'dragon123!', 'sunshine1!', 'football1!', 'safepath1!']);
+    const hasAllowedSpecialCharacter = /[@#$%!*]/.test(password);
+    if (password.length < 8 || password.length > 64 || /\s/.test(password)
+      || !/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/[0-9]/.test(password)
+      || !hasAllowedSpecialCharacter || commonPasswords.has(password.toLowerCase())) {
+      Alert.alert('Password does not meet requirements', 'Choose a password that satisfies every listed rule.');
+      return;
+    }
+    if (password !== passwordConfirmation) {
+      Alert.alert('Passwords do not match', 'Enter the same password in both password fields.');
+      return;
+    }
+    setLoading(true);
+    try {
+      const createdUser = await api<User>('/users', {
+        method: 'POST',
+        body: {
+          email: email.trim(),
+          display_name: name.trim(),
+          phone_number: phone.trim() || null,
+          auth_provider: 'mobile',
+          password,
+          password_confirmation: passwordConfirmation,
+        },
+      });
+      setUser(createdUser);
+      setStack(['home']);
+    } catch (error) {
+      Alert.alert('Could not create account', error instanceof Error ? error.message : 'Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadCommunityReports() {
+    setCommunityLoading(true);
+    setCommunityError('');
+    try {
+      const reports = await api<CommunityReport[]>('/reports?validated_only=false&limit=100');
+      setCommunityReports(reports);
+    } catch (error) {
+      setCommunityError(error instanceof Error ? error.message : 'Could not load community reports.');
+    } finally {
+      setCommunityLoading(false);
+    }
+  }
+
+  async function captureReportPhoto(source: 'camera' | 'gallery') {
+    if (source === 'camera') {
+      const permission = await ImagePicker.requestCameraPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert('Camera permission required', 'Allow camera access to capture a hazard photograph.');
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.75, allowsEditing: true });
+      if (!result.canceled) setReportPhotoUri(result.assets[0].uri);
+      return;
+    }
+
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert('Gallery permission required', 'Allow photo access to choose a hazard photograph.');
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.75, allowsEditing: true });
+    if (!result.canceled) setReportPhotoUri(result.assets[0].uri);
+  }
+
+  async function openReportForm() {
+    setReportPhotoUri(null);
+    setReportDescription('');
+    setReportType('pothole');
+    setReportLocation(null);
+    setReportFormOpen(true);
+    const permission = await Location.requestForegroundPermissionsAsync();
+    if (permission.status !== 'granted') {
+      Alert.alert('Location permission required', 'The report can be submitted without GPS, but location accuracy will be reduced.');
+      return;
+    }
+    const position = await Location.getCurrentPositionAsync({});
+    setReportLocation({ lat: position.coords.latitude, lng: position.coords.longitude });
+  }
+
+  async function submitCommunityReport() {
+    if (!reportLocation) {
+      Alert.alert('Location unavailable', 'Allow location access and try again before submitting the report.');
+      return;
+    }
+    setReportSubmitting(true);
+    try {
+      let mediaUrl: string | null = null;
+      if (reportPhotoUri) {
+        const formData = new FormData();
+        const extension = reportPhotoUri.split('.').pop()?.toLowerCase();
+        const mime = extension === 'png' ? 'image/png' : extension === 'webp' ? 'image/webp' : 'image/jpeg';
+        formData.append('file', { uri: reportPhotoUri, name: `report.${extension === 'png' ? 'png' : extension === 'webp' ? 'webp' : 'jpg'}`, type: mime } as any);
+        const upload = await fetch(`${API_URL}/reports/upload`, { method: 'POST', body: formData });
+        if (!upload.ok) throw new Error(await upload.text() || 'Photo upload failed.');
+        mediaUrl = (await upload.json()).media_url;
+      }
+
+      await api('/reports', {
+        method: 'POST',
+        body: {
+          user_id: user?.id ?? null,
+          incident_type: reportType,
+          severity: reportType === 'accident' ? 'high' : reportType === 'traffic_jam' ? 'medium' : 'medium',
+          lat: reportLocation.lat,
+          lng: reportLocation.lng,
+          description: reportDescription.trim() || null,
+          media_url: mediaUrl,
+        },
+      });
+      setReportFormOpen(false);
+      Alert.alert('Report submitted', 'Your community report has been submitted for validation.');
+      await loadCommunityReports();
+    } catch (error) {
+      Alert.alert('Submission failed', error instanceof Error ? error.message : 'Could not submit the report.');
+    } finally {
+      setReportSubmitting(false);
+    }
+  }
+
   async function saveRoute() {
     if (!user) {
       Alert.alert('Sign in required', 'Please log in to save routes.');
+      return;
+    }
+    if (!selectedTripRoute || !tripOrigin || !tripDestination) {
+      Alert.alert('Route unavailable', 'Generate a route before saving it.');
       return;
     }
     setLoading(true);
@@ -288,17 +1043,17 @@ export default function App() {
         method: 'POST',
         body: {
           user_id: user.id,
-          origin_name: stops[0],
-          destination_name: destination,
-          distance_km: 120,
-          duration_minutes: 165,
-          safety_score: routePref === 'Safest' ? 4.8 : 4.1,
-          route_type: routePref.toLowerCase().replace(' ', '_'),
-          provider: 'safepath',
+          origin_name: tripOrigin.name,
+          destination_name: tripDestination.name,
+          distance_km: selectedTripRoute.distance_m / 1000,
+          duration_minutes: selectedTripRoute.duration_s / 60,
+          safety_score: selectedTripRoute.safety_score === null ? 0 : selectedTripRoute.safety_score / 20,
+          route_type: routePref,
+          provider: 'osrm',
           is_saved: true,
         },
       });
-      Alert.alert('Route saved', `${destination} has been added to your trips.`);
+      Alert.alert('Route saved', `${tripDestination.name} has been added to your trips.`);
     } catch (e) {
       Alert.alert('Could not save route', e instanceof Error ? e.message : 'Please try again.');
     } finally {
@@ -331,10 +1086,15 @@ export default function App() {
     }
   }
 
+  /* community reports */
+  useEffect(() => {
+    if (screen === 'community') loadCommunityReports();
+  }, [screen]);
+
   /* accident countdown */
   useEffect(() => {
     if (screen !== 'accident') return;
-    setCountdown(5);
+    setCountdown(10);
     const id = setInterval(() => {
       setCountdown((c) => {
         if (c <= 1) {
@@ -372,25 +1132,79 @@ export default function App() {
   }
 
   function renderLogin() {
+    const commonPasswords = new Set(['123!', '12345678', 'password', 'password1!', 'password123!', '12345678aa!', '123456789aa!', 'qwerty123!', 'letmein1!', 'admin123!', 'welcome1!', 'iloveyou1!', 'abc12345!', 'changeme1!', 'passw0rd!', 'monkey123!', 'dragon123!', 'sunshine1!', 'football1!', 'safepath1!']);
+    const passwordRules = [
+      ['At least 8 characters', password.length >= 8],
+      ['No more than 64 characters', password.length <= 64],
+      ['At least one uppercase letter (A–Z)', /[A-Z]/.test(password)],
+      ['At least one lowercase letter (a–z)', /[a-z]/.test(password)],
+      ['At least one number (0–9)', /[0-9]/.test(password)],
+      ['At least one of @ # $ % ! *', /[@#$%!*]/.test(password)],
+      ['No spaces', !/\s/.test(password)],
+      ['Not a common password', !commonPasswords.has(password.toLowerCase())],
+      ['Confirmation matches', passwordConfirmation.length > 0 && password === passwordConfirmation],
+    ] as const;
     return (
       <View>
         <View style={[s.center, { paddingTop: 30, paddingBottom: 14 }]}>
           <Text style={[s.shield, { fontSize: 54 }]}>🛡️</Text>
-          <Text style={s.h1}>Welcome Back!</Text>
-          <Text style={s.white12}>Login to continue</Text>
+          <Text style={s.h1}>{signUpMode ? 'Create Account' : 'Welcome Back!'}</Text>
+          <Text style={s.white12}>{signUpMode ? 'Enter your details to get started' : 'Login to continue'}</Text>
         </View>
-        <Field value={email} onChangeText={setEmail} placeholder="Email or Phone" icon="✉" keyboardType="email-address" />
-        <Field value={password} onChangeText={setPassword} placeholder="Password" icon="🔒" secure />
-        <Text style={s.link}>Forgot Password?</Text>
-        <Btn title={loading ? 'Connecting…' : 'Login'} onPress={login} disabled={loading} />
-        <Text style={[s.muted, { textAlign: 'center', marginVertical: 18 }]}>or continue with</Text>
-        <View style={{ flexDirection: 'row', gap: 10 }}>
-          <View style={{ flex: 1 }}><Btn title="G  Google" outline onPress={() => Alert.alert('Google sign-in', 'Connect your Google OAuth provider here.')} /></View>
-          <View style={{ flex: 1 }}><Btn title="📞  Phone" outline onPress={() => Alert.alert('Phone sign-in', 'Connect your OTP provider here.')} /></View>
-        </View>
-        <Btn title="Continue as Guest" outline onPress={() => setStack(['home'])} />
+        {signUpMode ? (
+          <>
+            <Field label="Full Name" value={name} onChangeText={setName} placeholder="Your name" icon="☺" />
+            <Field label="Email" value={email} onChangeText={setEmail} placeholder="you@example.com" icon="✉" keyboardType="email-address" />
+            <Field label="Phone (optional)" value={phone} onChangeText={setPhone} placeholder="Phone number" icon="📞" keyboardType="phone-pad" />
+            <Field label="Password" value={password} onChangeText={setPassword} placeholder="Set a password" icon="🔒" secure maxLength={64} />
+            <Field label="Confirm password" value={passwordConfirmation} onChangeText={setPasswordConfirmation} placeholder="Enter password again" icon="🔒" secure maxLength={64} />
+            <View style={{ marginTop: 10 }}>
+              {passwordRules.map(([rule, passed]) => (
+                <Text key={rule} style={[s.muted, { color: passed ? C.green : C.muted, fontSize: 12, marginTop: 3 }]}>
+                  {passed ? '✓' : '·'} {rule}
+                </Text>
+              ))}
+            </View>
+          </>
+        ) : (
+          <>
+            <Field value={email} onChangeText={setEmail} placeholder="Email" icon="✉" keyboardType="email-address" />
+            <Field value={password} onChangeText={setPassword} placeholder="Password" icon="🔒" secure />
+            <Text style={s.link}>Forgot Password?</Text>
+          </>
+        )}
+        <Btn
+          title={loading ? (signUpMode ? 'Creating…' : 'Connecting…') : signUpMode ? 'Create Account' : 'Login'}
+          onPress={signUpMode ? signUp : login}
+          disabled={loading}
+        />
+        {!signUpMode ? (
+          <>
+            <Text style={[s.muted, { textAlign: 'center', marginVertical: 18 }]}>or continue with</Text>
+            <View style={{ flexDirection: 'row', gap: 10 }}>
+              <View style={{ flex: 1 }}><Btn title="G  Google" outline onPress={() => Alert.alert('Google sign-in', 'Connect your Google OAuth provider here.')} /></View>
+              <View style={{ flex: 1 }}><Btn title="📞  Phone" outline onPress={() => Alert.alert('Phone sign-in', 'Connect your OTP provider here.')} /></View>
+            </View>
+            <Btn title="Continue as Guest" outline onPress={() => setStack(['home'])} />
+          </>
+        ) : null}
         <Text style={[s.white12, { textAlign: 'center', marginTop: 40 }]}>
-          Don't have an account? <Text style={{ color: C.blueLight }} onPress={login}>Sign Up</Text>
+          {signUpMode ? 'Already have an account? ' : "Don't have an account? "}
+          <Text
+            style={{ color: C.blueLight }}
+            onPress={() => {
+              const enteringSignUp = !signUpMode;
+              setPassword('');
+              setPasswordConfirmation('');
+              if (enteringSignUp) {
+                setName('');
+                setPhone('');
+              }
+              setSignUpMode(enteringSignUp);
+            }}
+          >
+            {signUpMode ? 'Log In' : 'Sign Up'}
+          </Text>
         </Text>
       </View>
     );
@@ -398,7 +1212,7 @@ export default function App() {
 
   function renderHome() {
     return (
-      <>
+      <View style={{ paddingTop: 18 }}>
         <View style={s.rowBetween}>
           <View>
             <Text style={s.greeting}>Hello, {displayName.split(' ')[0]} 😊</Text>
@@ -412,10 +1226,9 @@ export default function App() {
 
         <View style={s.hero}>
           <View style={{ flex: 1 }}>
-            <Text style={s.heroTitle}>AI Recommendation</Text>
-            <Text style={s.heroSub}>Safest route available</Text>
-            <Text style={[s.heroSub, { fontWeight: '700', color: C.white }]}>Bengaluru → Mysuru</Text>
-            <Pressable style={s.heroBtn} onPress={() => go('route')}><Text style={s.heroBtnText}>View</Text></Pressable>
+            <Text style={s.heroTitle}>Trip Planner</Text>
+            <Text style={s.heroSub}>Build a route from your selected places</Text>
+            <Pressable style={s.heroBtn} onPress={() => go('trip')}><Text style={s.heroBtnText}>Plan Trip</Text></Pressable>
           </View>
           <Text style={{ fontSize: 56 }}>🚘</Text>
         </View>
@@ -440,54 +1253,43 @@ export default function App() {
         </Pressable>
 
         <Section>Recent Trips</Section>
-        <Group>
-          <Row icon="●" title="Bengaluru → Mysuru" value="Today" onPress={() => go('route')} />
-          <Row icon="●" title="College → Home" value="Yesterday" onPress={() => go('route')} last />
-        </Group>
+        <Text style={s.muted}>No saved trips yet. Generated routes you save will appear here.</Text>
 
         <View style={{ flexDirection: 'row', gap: 10, marginTop: 6 }}>
           <View style={{ flex: 1 }}><Btn title="Offline Maps" outline small onPress={() => go('offline')} /></View>
           <View style={{ flex: 1 }}><Btn title="Simulate Accident" outline small onPress={() => go('accident')} /></View>
         </View>
-      </>
+      </View>
     );
   }
 
   function renderNavigate(variant: 1 | 2) {
+    const distanceText = routeSummary
+      ? routeSummary.distanceM >= 1000
+        ? `${(routeSummary.distanceM / 1000).toFixed(1)} km`
+        : `${Math.round(routeSummary.distanceM)} m`
+      : 'Searching route';
+    const durationMinutes = routeSummary ? Math.max(1, Math.round(routeSummary.durationS / 60)) : null;
+    const durationText = durationMinutes === null
+      ? 'Calculating'
+      : durationMinutes >= 60
+        ? `${Math.floor(durationMinutes / 60)}h ${durationMinutes % 60}m`
+        : `${durationMinutes}m`;
+    const arrivalText = routeSummary
+      ? new Date(Date.now() + routeSummary.durationS * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : 'Calculating';
+
     return (
-      <View>
-        <View style={s.turn}>
-          <Text style={s.turnArrow}>{variant === 1 ? '↰' : '↱'}</Text>
-          <View>
-            <Text style={s.turnTitle}>{variant === 1 ? 'Turn Left' : '100 m'}</Text>
-            <Text style={s.turnTitle}>{variant === 1 ? '200 m' : 'Turn Right'}</Text>
-          </View>
-          {variant === 2 ? <Text style={[s.mini, { marginLeft: 'auto', color: C.orange }]}>46 km/h</Text> : null}
-        </View>
-
-        <MapMock variant={variant} hazards={variant === 2} />
-
-        {variant === 2 ? (
-          <View style={{ gap: 6, marginTop: 10 }}>
-            {[['Pothole', '250 m ahead'], ['Accident', '160 m ahead'], ['Traffic Jam', '']].map(([t, d]) => (
-              <View key={t} style={s.alertChip}>
-                <Text style={{ fontSize: 16 }}>⚠️</Text>
-                <View style={{ marginLeft: 8 }}>
-                  <Text style={s.rowTitle}>{t}</Text>
-                  {d ? <Text style={s.muted}>{d}</Text> : null}
-                </View>
-              </View>
-            ))}
-          </View>
-        ) : null}
+      <View style={{ flex: 1, paddingTop: 38 }}>
+        <MapMock variant={variant} hazards={variant === 2} onRouteSummary={setRouteSummary} />
 
         <View style={s.etaBar}>
           <View>
-            <Text style={s.etaBig}>2h 45m</Text>
-            <Text style={s.muted}>120 km</Text>
+            <Text style={s.etaBig}>{durationText}</Text>
+            <Text style={s.muted}>{distanceText}</Text>
           </View>
           <View>
-            <Text style={s.etaBig}>10:30 AM</Text>
+            <Text style={s.etaBig}>{arrivalText}</Text>
             <Text style={s.muted}>Arrival</Text>
           </View>
           <Pressable style={s.exit} onPress={back}><Text style={s.btnText}>Exit</Text></Pressable>
@@ -501,7 +1303,6 @@ export default function App() {
             </Pressable>
           ))}
         </View>
-        <Btn title="Save Safe Route" outline onPress={saveRoute} disabled={loading} />
       </View>
     );
   }
@@ -509,52 +1310,171 @@ export default function App() {
   function renderTrip() {
     return (
       <>
-        <Group>
-          {stops.map((st, i) => (
-            <View key={i} style={s.row}>
-              <Text style={[s.rowIcon, { color: i === 0 ? C.blueLight : i === stops.length - 1 ? C.red : C.orange }]}>●</Text>
-              <TextInput
-                value={st}
-                onChangeText={(v) => setStops((arr) => arr.map((x, j) => (j === i ? v : x)))}
-                style={[s.rowTitle, { flex: 1, padding: 0 }]}
-                placeholderTextColor={C.muted}
+        <Section>Starting Point — Place A</Section>
+        <TripPlaceField
+          label="Starting point"
+          value={tripOrigin}
+          onChange={(place) => { setTripOrigin(place); clearTripResult(); }}
+        />
+        <Section>Intermediate Stops</Section>
+        {tripStops.map((stop, index) => (
+          <View key={stop.id} style={s.tripStop}>
+            <View style={{ flex: 1 }}>
+              <TripPlaceField
+                label={`Stop ${index + 1}`}
+                value={stop.place}
+                onChange={(place) => {
+                  setTripStops((current) => current.map((item) => item.id === stop.id ? { ...item, place } : item));
+                  clearTripResult();
+                }}
               />
-              {stops.length > 2 && i > 0 && i < stops.length - 1 ? (
-                <Text style={{ color: C.red, fontSize: 16 }} onPress={() => setStops((arr) => arr.filter((_, j) => j !== i))}>✕</Text>
-              ) : <Text style={s.arrow}>›</Text>}
             </View>
-          ))}
-        </Group>
+            <View style={s.tripStopActions}>
+              <Pressable
+                disabled={index === 0}
+                onPress={() => {
+                  setTripStops((current) => {
+                    const next = [...current];
+                    [next[index - 1], next[index]] = [next[index], next[index - 1]];
+                    return next;
+                  });
+                  clearTripResult();
+                }}
+              ><Text style={[s.tripAction, index === 0 && s.disabledText]}>↑</Text></Pressable>
+              <Pressable
+                disabled={index === tripStops.length - 1}
+                onPress={() => {
+                  setTripStops((current) => {
+                    const next = [...current];
+                    [next[index + 1], next[index]] = [next[index], next[index + 1]];
+                    return next;
+                  });
+                  clearTripResult();
+                }}
+              ><Text style={[s.tripAction, index === tripStops.length - 1 && s.disabledText]}>↓</Text></Pressable>
+              <Pressable
+                onPress={() => {
+                  setTripStops((current) => current.filter((item) => item.id !== stop.id));
+                  clearTripResult();
+                }}
+              ><Text style={[s.tripAction, { color: C.red }]}>×</Text></Pressable>
+            </View>
+          </View>
+        ))}
         <Pressable
           style={s.addBtn}
-          onPress={() => setStops((arr) => [...arr.slice(0, -1), `Stop ${arr.length - 1}`, arr[arr.length - 1]])}
+          onPress={() => {
+            setTripStops((current) => [...current, { id: nextTripStopId++, place: null }]);
+            clearTripResult();
+          }}
         >
-          <Text style={{ color: C.blueLight }}>＋  Add Destination</Text>
+          <Text style={{ color: C.blueLight }}>＋  Add Stop</Text>
         </Pressable>
+        <Section>Destination — Place B</Section>
+        <TripPlaceField
+          label="Destination"
+          value={tripDestination}
+          onChange={(place) => { setTripDestination(place); clearTripResult(); }}
+        />
 
         <Section>Vehicle Type</Section>
-        <View style={s.vehicleRow}>
-          {[['🏍️', 'Bike'], ['🚗', 'Car'], ['🔌', 'EV'], ['🚌', 'Bus']].map(([i, l]) => (
-            <Pressable key={l} onPress={() => setVehicle(l)} style={[s.vehicle, vehicle === l && { borderColor: C.blue, backgroundColor: C.panel2 }]}>
-              <Text style={{ fontSize: 22 }}>{i}</Text>
-              <Text style={s.white12}>{l}</Text>
+        <View style={s.vehicleGrid}>
+          {([
+            ['🏍️', 'Bike', 'bike'],
+            ['🚗', 'Car', 'car'],
+            ['🔌', 'EV', 'ev'],
+            ['🚌', 'Bus', 'bus'],
+          ] as const).map(([icon, label, value]) => (
+            <Pressable
+              key={value}
+              onPress={() => { setVehicle(value); clearTripResult(); }}
+              style={[s.tripChoice, vehicle === value && s.tripChoiceActive]}
+              accessibilityRole="button"
+              accessibilityState={{ selected: vehicle === value }}
+            >
+              <Text style={{ fontSize: 22 }}>{icon}</Text>
+              <Text style={s.white12}>{label}</Text>
             </Pressable>
           ))}
         </View>
 
         <Section>Route Preference</Section>
-        <View style={s.chipRow}>
-          {['Best', 'Safest', 'Fuel Saver', 'Less Traffic'].map((p) => (
-            <Chip key={p} label={p} active={routePref === p} onPress={() => setRoutePref(p)} />
+        <View style={s.preferenceGrid}>
+          {([
+            ['best', 'Best', 'Balances distance, provider duration, and available hazard data.'],
+            ['safest', 'Safest', 'Ranks using active reported hazard exposure when data exists.'],
+            ['fuel_saver', 'Fuel Saver', 'Ranks shorter distance first; cost data is not configured.'],
+            ['less_traffic', 'Less Traffic', 'Ranks provider duration; live traffic is unavailable.'],
+          ] as const).map(([value, label, description]) => (
+            <Pressable
+              key={value}
+              onPress={() => { setRoutePref(value); clearTripResult(); }}
+              style={[s.preferenceChoice, routePref === value && s.tripChoiceActive]}
+              accessibilityRole="button"
+              accessibilityState={{ selected: routePref === value }}
+            >
+              <Text style={[s.rowTitle, { color: routePref === value ? C.blueLight : C.white }]}>{label}</Text>
+              <Text style={s.mini}>{description}</Text>
+            </Pressable>
           ))}
         </View>
 
-        <Btn title="Generate Route" onPress={() => go('route')} />
-        <View style={[s.rowBetween, { marginTop: 18 }]}>
-          <View><Text style={s.mini}>Total Distance</Text><Text style={s.etaBig}>120 km</Text></View>
-          <View><Text style={s.mini}>Est. Time</Text><Text style={s.etaBig}>2h 45m</Text></View>
-          <View><Text style={s.mini}>Est. Fuel</Text><Text style={s.etaBig}>₹650</Text></View>
-        </View>
+        {tripError ? <Text style={s.tripError}>{tripError}</Text> : null}
+        {tripLoading ? <ActivityIndicator color={C.blueLight} style={{ marginTop: 16 }} /> : null}
+        <Btn title={tripLoading ? 'Generating Route…' : 'Generate Route'} disabled={tripLoading} onPress={generateTrip} />
+
+        {tripPlan && selectedTripRoute && tripOrigin && tripDestination ? (
+          <>
+            <Section>Selected Route — {tripRouteIndex === 0 ? 'Recommended' : `Alternative ${tripRouteIndex}`} · {tripPlan.provider}</Section>
+            <View style={s.tripMap}>
+              <LiveMap
+                apiUrl={API_URL}
+                style={{ height: 320 }}
+                showSearch={false}
+                showRoutePanel={false}
+                initialCenter={{ lat: tripOrigin.lat, lng: tripOrigin.lng }}
+                destination={{ lat: tripDestination.lat, lng: tripDestination.lng }}
+                plannedRoutes={tripMapRoutes}
+                plannedWaypoints={tripMapWaypoints}
+                selectedRouteIndex={tripRouteIndex}
+              />
+            </View>
+            <View style={[s.group, { padding: 14 }]}>
+              <Text style={s.rowTitle}>Trip Summary</Text>
+              <Text style={s.muted}>Total distance: {formatTripDistance(selectedTripRoute.distance_m)}</Text>
+              <Text style={s.muted}>Estimated time: {formatTripDuration(selectedTripRoute.duration_s)}</Text>
+              <Text style={s.muted}>
+                {vehicle === 'ev' ? 'Estimated energy / charging cost: ' : 'Estimated fuel / cost: '}
+                {selectedTripRoute.estimated_cost === null
+                  ? vehicle === 'ev' && selectedTripRoute.energy_kwh !== null
+                    ? `${selectedTripRoute.energy_kwh.toFixed(1)} kWh; charging cost unavailable`
+                    : selectedTripRoute.fuel_litres !== null
+                      ? `${selectedTripRoute.fuel_litres.toFixed(1)} L; cost unavailable`
+                      : 'Unavailable'
+                  : `₹${selectedTripRoute.estimated_cost.toFixed(2)} (estimate)`}
+              </Text>
+              <Text style={s.muted}>
+                Hazard score: {selectedTripRoute.safety_score === null ? 'Unavailable — no active hazard data' : `${selectedTripRoute.safety_score}/100`}
+              </Text>
+              <Text style={[s.mini, { marginTop: 8 }]}>{tripPlan.ranking_note}</Text>
+              <Text style={s.mini}>{tripPlan.estimation_note}</Text>
+            </View>
+            <Section>Route Alternatives</Section>
+            {tripPlan.routes.map((route, index) => (
+              <Pressable
+                key={`${route.rank}-${index}`}
+                onPress={() => setTripRouteIndex(index)}
+                style={[s.routeOption, tripRouteIndex === index && s.tripChoiceActive]}
+                accessibilityRole="button"
+                accessibilityState={{ selected: tripRouteIndex === index }}
+              >
+                <Text style={s.rowTitle}>{index === 0 ? 'Recommended' : `Alternative ${index}`}</Text>
+                <Text style={s.muted}>{formatTripDistance(route.distance_m)} · {formatTripDuration(route.duration_s)}</Text>
+              </Pressable>
+            ))}
+            <Btn title="Route Details" outline onPress={() => go('route')} />
+          </>
+        ) : null}
       </>
     );
   }
@@ -573,12 +1493,28 @@ export default function App() {
         <View style={s.group}>
           <View style={[s.rowBetween, { padding: 14 }]}>
             <Text style={s.rowTitle}>Battery Level</Text>
-            <Text style={{ color: C.orange, fontWeight: '700' }}>65%</Text>
+            <Text style={{ color: C.orange, fontWeight: '700' }}>
+              {batteryLoading ? 'Checking…' : batteryLevel === null ? 'Unavailable' : `${batteryLevel}%`}
+            </Text>
           </View>
           <Row icon="📍" title="Live Location Sharing" value="Active" valueColor={C.green} />
-          <Row icon="👤" title="Taal" onPress={() => go('emergency')} last />
+          {contactsLoading ? (
+            <Row icon="👤" title="Emergency contacts" value="Loading…" last />
+          ) : emergencyContacts.length ? (
+            emergencyContacts.map((contact, index) => (
+              <Row
+                key={contact.id}
+                icon="👤"
+                title={contact.name}
+                value={contact.phone}
+                last={index === emergencyContacts.length - 1}
+              />
+            ))
+          ) : (
+            <Row icon="👤" title="No emergency contacts added" last />
+          )}
         </View>
-        <Pressable style={s.addBtn} onPress={() => go('emergency')}><Text style={{ color: C.blueLight }}>＋  Add Contact</Text></Pressable>
+        <Pressable style={s.addBtn} onPress={openContactEditor}><Text style={{ color: C.blueLight }}>＋  Add Contact</Text></Pressable>
 
         <View style={s.tileRow}>
           {[['🏥', 'Emergency Contacts'], ['👮', 'Police station'], ['🚑', 'Ambulance']].map(([i, l]) => (
@@ -594,37 +1530,77 @@ export default function App() {
   }
 
   function renderComm() {
-    const peers = [
-      ["Rohit's Phone", '120 m', 'Strong', C.green],
-      ["Anita's Phone", '200 m', 'Strong', C.green],
-      ["Vikram's Phone", '250 m', 'Medium', C.yellow],
-      ["Sneha's Phone", '400 m', 'Weak', C.red],
-    ];
+    const signalStrength = (rssi: number) => rssi >= -60
+      ? { label: 'Strong', color: C.green }
+      : rssi >= -75
+        ? { label: 'Medium', color: C.yellow }
+        : { label: 'Weak', color: C.red };
     return (
       <>
         <View style={s.comms}>
           <Text style={{ fontSize: 28 }}>📶</Text>
           <View style={{ flex: 1, marginLeft: 12 }}>
-            <Text style={s.rowTitle}>Mesh Network</Text>
-            <Text style={s.muted}>Connected</Text>
-            <Text style={s.muted}>5 Peers Nearby</Text>
+            <Text style={s.rowTitle}>Bluetooth Help Network</Text>
+            <Text style={s.muted}>{bleStatus === 'ready' ? 'Advertising and ready' : bleStatus === 'starting' ? 'Starting Bluetooth…' : 'Bluetooth unavailable'}</Text>
+            <Text style={s.muted}>{savedBlePeers.filter((peer) => peer.connected).length} connected · {savedBlePeers.length}/{MAX_SAVED_BLE_PEERS} saved</Text>
           </View>
-          <Text style={{ fontSize: 24 }}>🛜</Text>
+          <Text style={{ fontSize: 24 }}>ᛒ</Text>
         </View>
         <View style={[s.group, { padding: 14, marginTop: 12 }]}>
           <Text style={s.rowTitle}>My Status</Text>
           <View style={[s.rowBetween, { marginTop: 8 }]}>
-            <Text style={{ color: C.orange }}>● Online</Text>
-            <Text style={s.white12}>Battery: 78%</Text>
+            <Text style={{ color: bleStatus === 'ready' ? C.green : C.orange }}>
+              ● {bleStatus === 'ready' ? 'Available to SafePath devices nearby' : bleStatus === 'starting' ? 'Connecting…' : 'Not available'}
+            </Text>
+            <Text style={s.white12}>
+              Battery: {batteryLoading ? 'Checking…' : batteryLevel === null ? 'Unavailable' : `${batteryLevel}%`}
+            </Text>
           </View>
         </View>
-        <Section>Nearby Peers</Section>
+        <Section>Nearby SafePath Devices</Section>
         <Group>
-          {peers.map(([n, d, q, col], i) => (
-            <Row key={n} icon="📍" title={`${n}  ·  ${d}`} value={q} valueColor={col} last={i === peers.length - 1} />
-          ))}
+          {savedBlePeers.length === 0 ? (
+            <Row icon="📍" title="No devices connected yet" value="Add a nearby device to get started" last />
+          ) : savedBlePeers.map((peer, index) => {
+            const signal = signalStrength(peer.rssi);
+            return (
+              <View key={peer.id} style={[s.row, index === savedBlePeers.length - 1 && { borderBottomWidth: 0 }]}>
+                <Text style={s.rowIcon}>📍</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.rowTitle}>{peer.name}</Text>
+                  <Text style={s.muted}>{peer.connected ? 'Connected by Bluetooth' : 'Not connected'}</Text>
+                </View>
+                <Text style={{ color: peer.connected ? signal.color : C.muted, fontSize: 12 }}>
+                  {peer.connected ? signal.label : 'Offline'}
+                </Text>
+                <Pressable onPress={() => { void removeBluetoothPeer(peer.id); }} hitSlop={10} style={{ marginLeft: 12 }}>
+                  <Text style={{ color: C.red, fontSize: 13 }}>Remove</Text>
+                </Pressable>
+              </View>
+            );
+          })}
         </Group>
-        <Btn title="Broadcast Message" onPress={() => Alert.alert('Broadcast', 'Message sent to 5 nearby peers.')} />
+        <Pressable
+          style={s.addBtn}
+          disabled={savedBlePeers.length >= MAX_SAVED_BLE_PEERS || bleStatus !== 'ready'}
+          onPress={() => {
+            setPeerPickerOpen(true);
+            void scanForBluetoothPeers();
+          }}
+        >
+          <Text style={{ color: C.blueLight }}>
+            ＋  {savedBlePeers.length >= MAX_SAVED_BLE_PEERS ? 'Maximum devices added' : 'Add Nearby Device'}
+          </Text>
+        </Pressable>
+        {bleError ? <Text style={[s.muted, { color: C.red, marginTop: 8 }]}>{bleError}</Text> : null}
+        <Text style={[s.muted, { marginTop: 10 }]}>
+          Only SafePath AI devices with Bluetooth enabled can connect. Messages are sent only to connected devices; avoid sharing sensitive personal information.
+        </Text>
+        <Btn
+          title="Broadcast Message"
+          disabled={savedBlePeers.every((peer) => !peer.connected)}
+          onPress={() => setBroadcastModalOpen(true)}
+        />
       </>
     );
   }
@@ -698,16 +1674,14 @@ export default function App() {
   }
 
   function renderRoute() {
-    const rows: [string, string, string, string?][] = [
-      ['🌐', 'Total Distance', '120 km'],
-      ['⏱️', 'Estimated Time', '2h 45m'],
-      ['⛽', 'Fuel Estimation', '₹650 (6.5 L)'],
-      ['🛡️', 'Safety Score', '4.6 / 5', C.orange],
-      ['🚦', 'Traffic Status', 'Moderate', C.orange],
-      ['🛣️', 'Road Quality', 'Good', C.orange],
-    ];
+    const route = selectedTripRoute;
+    const costLabel = vehicle === 'ev' ? 'Estimated Energy / Charging Cost' : 'Estimated Fuel / Cost';
+    const estimatedCost = route?.estimated_cost === null || route?.estimated_cost === undefined
+      ? 'Unavailable'
+      : `₹${route.estimated_cost.toFixed(2)} (estimate)`;
     return (
       <>
+        {!route ? <Text style={s.muted}>Generate a trip route to see real journey details here.</Text> : null}
         <View style={s.tabs}>
           {['Overview', 'Steps', 'Traffic', 'Reviews'].map((t) => (
             <Pressable key={t} onPress={() => setRouteTab(t)} style={[s.tabBtn, routeTab === t && { borderBottomColor: C.blueLight }]}>
@@ -716,28 +1690,48 @@ export default function App() {
           ))}
         </View>
         {routeTab === 'Overview' ? (
-          <Group>{rows.map(([i, l, v, col], idx) => <Row key={l} icon={i} title={l} value={v} valueColor={col} last={idx === rows.length - 1} />)}</Group>
-        ) : routeTab === 'Steps' ? (
           <Group>
-            {['Head south on MG Road', 'Merge onto NH 275', 'Continue through Ramanagara', 'Pass Mandya bypass', 'Arrive at Mysuru'].map((t, i, a) => (
-              <Row key={t} icon={`${i + 1}.`} title={t} last={i === a.length - 1} />
-            ))}
+            <Row icon="🌐" title="Total Distance" value={route ? formatTripDistance(route.distance_m) : 'Unavailable'} />
+            <Row icon="⏱️" title="Estimated Time" value={route ? formatTripDuration(route.duration_s) : 'Unavailable'} />
+            <Row icon="⛽" title={costLabel} value={estimatedCost} />
+            <Row
+              icon="🛡️"
+              title="Hazard Score"
+              value={route?.safety_score === null || !route ? 'Unavailable' : `${route.safety_score}/100`}
+              last
+            />
+            {tripPlan ? <Text style={[s.mini, { padding: 12 }]}>{tripPlan.estimation_note}</Text> : null}
           </Group>
+        ) : routeTab === 'Steps' ? (
+          route ? (
+            <Group>
+              {route.legs.map((leg, index) => (
+                <Row
+                  key={`${leg.origin_name}-${leg.destination_name}-${index}`}
+                  icon={`${index + 1}.`}
+                  title={`${leg.origin_name} → ${leg.destination_name}`}
+                  value={`${formatTripDistance(leg.distance_m)} · ${formatTripDuration(leg.duration_s)}`}
+                  last={index === route.legs.length - 1}
+                />
+              ))}
+            </Group>
+          ) : <Text style={s.muted}>No route leg data available.</Text>
         ) : routeTab === 'Traffic' ? (
           <Group>
-            <Row icon="🟢" title="Bengaluru outskirts" value="Light" valueColor={C.green} />
-            <Row icon="🟠" title="Ramanagara" value="Moderate" valueColor={C.orange} />
-            <Row icon="🔴" title="Mandya bypass" value="Heavy" valueColor={C.red} last />
+            <Row
+              icon="🚦"
+              title="Live traffic data"
+              value={tripPlan?.traffic_data_available ? 'Available' : 'Unavailable'}
+              last
+            />
+            <Text style={[s.mini, { padding: 12 }]}>The selected routing provider supplies route duration estimates, not live traffic conditions.</Text>
           </Group>
         ) : (
-          <Group>
-            <Row icon="★" title="Smooth highway, well lit" value="4.8" />
-            <Row icon="★" title="Watch for potholes near Mandya" value="4.1" last />
-          </Group>
+          <Text style={s.muted}>No trip reviews are available.</Text>
         )}
         <View style={{ flexDirection: 'row', gap: 10 }}>
-          <View style={{ flex: 1 }}><Btn title="Save Route" outline onPress={saveRoute} disabled={loading} /></View>
-          <View style={{ flex: 1 }}><Btn title="Download" onPress={() => go('offline')} /></View>
+          <View style={{ flex: 1 }}><Btn title="Save Route" outline onPress={saveRoute} disabled={loading || !route} /></View>
+          <View style={{ flex: 1 }}><Btn title="Download" onPress={() => go('offline')} disabled={!route} /></View>
         </View>
       </>
     );
@@ -752,9 +1746,22 @@ export default function App() {
           <Text style={s.muted}>{user?.email ?? 'rohan.kumar@gmail.com'}</Text>
         </View>
         <Group>
-          <Row icon="🚗" title="My Vehicle" value="KA 01 AB 1234" onPress={() => Alert.alert('My Vehicle', 'Edit vehicle details.')} />
-          <Row icon="📞" title="Emergency Contacts" value="3 Contacts" onPress={() => go('emergency')} />
-          <Row icon="📍" title="Saved Places" value="12 Places" onPress={() => Alert.alert('Saved Places', '12 saved places.')} />
+          <Row
+            icon="🚗"
+            title="My Vehicle"
+            value={vehicleNumberLoading ? 'Loading…' : vehicleNumber || 'Add vehicle number'}
+            onPress={openVehicleEditor}
+          />
+          <Row icon="📞" title="Emergency Contacts" value={`${emergencyContacts.length} Contacts`} onPress={() => go('emergency')} />
+          <Row
+            icon="📍"
+            title="Saved Places"
+            value={savedPlacesLoading ? 'Loading…' : `${savedPlaces.length} Places`}
+            onPress={() => Alert.alert(
+              'Saved Places',
+              savedPlaces.length > 0 ? savedPlaces.map((place) => place.name).join('\n') : 'You have no saved places yet.',
+            )}
+          />
           <Row icon="🕘" title="Route History" value="8 Trips" onPress={() => go('route')} />
           <Row icon="⚙️" title="Settings" onPress={() => go('settings')} />
           <Row icon="🚪" title="Logout" onPress={() => { setUser(null); setStack(['login']); }} last />
@@ -786,31 +1793,106 @@ export default function App() {
   }
 
   function renderCommunity() {
-    const reports = [
-      { t: 'Hazards', n: 'Pothole', w: 'Hosur Road, Bengaluru', a: '2 min ago', i: '⚠️' },
-      { t: 'Traffic', n: 'Traffic Jam', w: 'Nice Road, Bengaluru', a: '50 min ago', i: '🚗' },
-      { t: 'Accidents', n: 'Accident', w: 'Mysuru Road', a: '25 min ago', i: '🚨' },
-      { t: 'Hazards', n: 'Flooded Road', w: 'Mandya, Karnataka', a: '80 min ago', i: '🌊' },
-    ].filter((r) => reportFilter === 'All' || r.t === reportFilter);
+    const reportIcon: Record<string, string> = {
+      pothole: '⚠️', traffic_jam: '🚗', accident: '🚨', flooded_road: '🌊',
+      flood: '🌊', fire: '🔥', blockage: '🚧',
+    };
+    const reportCategory: Record<string, string> = {
+      pothole: 'Hazards', traffic_jam: 'Traffic', accident: 'Accidents', flooded_road: 'Hazards',
+      flood: 'Hazards', fire: 'Hazards', blockage: 'Hazards',
+    };
+    const visibleReports = communityReports.filter((report) =>
+      reportFilter === 'All' || reportCategory[report.incident_type] === reportFilter
+    );
+    const relativeTime = (createdAt: string) => {
+      const elapsed = Math.max(0, Date.now() - new Date(createdAt).getTime());
+      const minutes = Math.floor(elapsed / 60000);
+      if (minutes < 1) return 'Just now';
+      if (minutes < 60) return `${minutes} min ago`;
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return `${hours} hr ago`;
+      return `${Math.floor(hours / 24)} day ago`;
+    };
+
     return (
       <>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }}>
           {['All', 'Hazards', 'Traffic', 'Accidents'].map((f) => <Chip key={f} label={f} active={reportFilter === f} onPress={() => setReportFilter(f)} />)}
         </ScrollView>
-        {reports.map((r) => (
-          <View key={r.n} style={s.report}>
-            <Text style={{ fontSize: 30 }}>{r.i}</Text>
+        {communityLoading ? <Text style={[s.muted, { textAlign: 'center', marginVertical: 16 }]}>Loading reports…</Text> : null}
+        {communityError ? <Text style={[s.muted, { color: C.red, textAlign: 'center', marginVertical: 16 }]}>{communityError}</Text> : null}
+        {!communityLoading && !communityError && visibleReports.length === 0 ? <Text style={[s.muted, { textAlign: 'center', marginVertical: 16 }]}>No community reports in this category.</Text> : null}
+        {visibleReports.map((report) => (
+          <View key={report.id} style={s.report}>
+            {report.media_url ? (
+              <Image source={{ uri: report.media_url }} style={{ width: 44, height: 44, borderRadius: 8 }} resizeMode="cover" />
+            ) : (
+              <Text style={{ fontSize: 30 }}>{reportIcon[report.incident_type] ?? '⚠️'}</Text>
+            )}
             <View style={{ flex: 1, marginLeft: 12 }}>
-              <Text style={s.rowTitle}>{r.n}</Text>
-              <Text style={s.muted}>{r.w}</Text>
-              <Text style={s.muted}>{r.a}</Text>
+              <Text style={s.rowTitle}>{report.incident_type.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())}</Text>
+              <Text style={s.muted}>{report.description || `${report.lat.toFixed(4)}, ${report.lng.toFixed(4)}`}</Text>
+              <Text style={s.muted}>{relativeTime(report.created_at)}</Text>
             </View>
-            <Text style={{ color: C.red, fontSize: 18 }}>▲</Text>
+            <Pressable onPress={async () => {
+              try {
+                await api(`/reports/${report.id}/vote`, { method: 'POST', body: { user_id: user?.id ?? null, vote: 'up' } });
+                await loadCommunityReports();
+              } catch (error) {
+                Alert.alert('Vote could not be saved', error instanceof Error ? error.message : 'Please try again.');
+              }
+            }}><Text style={{ color: C.red, fontSize: 18 }}>▲ {report.upvotes}</Text></Pressable>
           </View>
         ))}
-        <Pressable style={s.fab} onPress={() => Alert.alert('Report', 'Report submitted to the community.')}>
+        <Pressable style={s.fab} onPress={openReportForm}>
           <Text style={s.btnText}>＋ Report</Text>
         </Pressable>
+
+        {reportFormOpen ? (
+          <View style={s.reportModalBackdrop}>
+            <View style={s.reportModal}>
+              <Text style={s.h1}>Create Community Report</Text>
+              <Text style={s.muted}>Incident type</Text>
+              <View style={s.reportTypeGrid}>
+                {([['pothole', '⚠️ Pothole'], ['traffic_jam', '🚗 Traffic Jam'], ['accident', '🚨 Accident'], ['flooded_road', '🌊 Flooded Road']] as [ReportType, string][]).map(([type, label]) => (
+                  <Pressable key={type} onPress={() => setReportType(type)} style={[s.reportTypeChip, reportType === type && { backgroundColor: C.blue, borderColor: C.blue }]}>
+                    <Text style={s.white12}>{label}</Text>
+                  </Pressable>
+                ))}
+              </View>
+              {reportPhotoUri ? (
+                <>
+                  {/* eslint-disable-next-line @typescript-eslint/no-var-requires */}
+                  <Image source={{ uri: reportPhotoUri }} style={s.reportPhoto} resizeMode="cover" />
+                  <View style={{ flexDirection: 'row', gap: 10 }}>
+                    <View style={{ flex: 1 }}><Btn title="Retake" outline onPress={() => captureReportPhoto('camera')} /></View>
+                    <View style={{ flex: 1 }}><Btn title="Replace" outline onPress={() => captureReportPhoto('gallery')} /></View>
+                  </View>
+                </>
+              ) : (
+                <View style={{ flexDirection: 'row', gap: 10 }}>
+                  <View style={{ flex: 1 }}><Btn title="📷 Camera" outline onPress={() => captureReportPhoto('camera')} /></View>
+                  <View style={{ flex: 1 }}><Btn title="🖼 Gallery" outline onPress={() => captureReportPhoto('gallery')} /></View>
+                </View>
+              )}
+              <Text style={[s.muted, { marginTop: 12 }]}>Location: {reportLocation ? `${reportLocation.lat.toFixed(5)}, ${reportLocation.lng.toFixed(5)}` : 'Fetching GPS…'}</Text>
+              <TextInput value={reportDescription} onChangeText={setReportDescription} placeholder="Optional description" placeholderTextColor={C.muted} multiline style={s.reportDescription} />
+              <View style={{ flexDirection: 'row', gap: 10 }}>
+                <View style={{ flex: 1 }}><Btn title="Cancel" outline disabled={reportSubmitting} onPress={() => setReportFormOpen(false)} /></View>
+                <View style={{ flex: 1 }}><Btn title={reportSubmitting ? 'Submitting…' : 'Submit Report'} disabled={reportSubmitting} onPress={() => {
+                  Alert.alert(
+                    'Submit report?',
+                    'Confirm that the hazard details and location are accurate before submitting.',
+                    [
+                      { text: 'Cancel', style: 'cancel' },
+                      { text: 'Submit', onPress: submitCommunityReport },
+                    ]
+                  );
+                }} /></View>
+              </View>
+            </View>
+          </View>
+        ) : null}
       </>
     );
   }
@@ -847,6 +1929,32 @@ export default function App() {
   function renderEmergency() {
     return (
       <>
+        <Section>Emergency Contacts</Section>
+        {contactsLoading ? <Text style={s.muted}>Loading saved contacts…</Text> : null}
+        {!contactsLoading && emergencyContacts.length === 0 ? (
+          <Text style={s.muted}>No emergency contacts added yet.</Text>
+        ) : null}
+        {emergencyContacts.map((contact) => (
+          <View key={contact.id} style={[s.contactCard, s.rowBetween]}>
+            <View style={{ flex: 1 }}>
+              <Text style={s.rowTitle}>{contact.name}</Text>
+              <Text style={s.muted}>{contact.phone}</Text>
+            </View>
+            <Pressable
+              onPress={() => Alert.alert('Remove contact?', `Remove ${contact.name} from emergency contacts?`, [
+                { text: 'Cancel', style: 'cancel' },
+                { text: 'Remove', style: 'destructive', onPress: () => { void removeEmergencyContact(contact.id); } },
+              ])}
+              accessibilityRole="button"
+              accessibilityLabel={`Remove ${contact.name}`}
+            >
+              <Text style={{ color: C.red, fontSize: 18 }}>×</Text>
+            </Pressable>
+          </View>
+        ))}
+        <Pressable style={s.addBtn} onPress={openContactEditor}>
+          <Text style={{ color: C.blueLight }}>＋  Add Contact</Text>
+        </Pressable>
         <Text style={[s.white12, { textAlign: 'center', fontSize: 14, marginTop: 4 }]}>Fill only if you want to share{'\n'}during emergency</Text>
         <Field label="Name" value={name} onChangeText={setName} />
         <Field label="Phone" value={phone} onChangeText={setPhone} keyboardType="phone-pad" />
@@ -905,16 +2013,228 @@ export default function App() {
     <View style={[s.outer, isDanger && { backgroundColor: '#1D1426' }]}>
     <SafeAreaView style={[s.safe, s.phone, isDanger && { backgroundColor: '#1D1426' }]}>
       <StatusBar barStyle="light-content" />
+      <Modal
+        visible={vehicleEditorOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setVehicleEditorOpen(false)}
+      >
+        <View style={s.vehicleModalBackdrop}>
+          <View style={s.vehicleModal}>
+            <Text style={s.rowTitle}>My Vehicle</Text>
+            <Text style={[s.muted, { marginTop: 6 }]}>Enter your vehicle registration number.</Text>
+            <View style={[s.inputWrap, { marginTop: 14 }]}>
+              <TextInput
+                value={vehicleNumberDraft}
+                onChangeText={setVehicleNumberDraft}
+                placeholder="Vehicle number"
+                placeholderTextColor={C.muted}
+                maxLength={20}
+                autoCapitalize="characters"
+                autoCorrect={false}
+                style={s.input}
+                returnKeyType="done"
+                onSubmitEditing={saveVehicleNumber}
+              />
+            </View>
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 14 }}>
+              <View style={{ flex: 1 }}>
+                <Btn title="Cancel" outline onPress={() => setVehicleEditorOpen(false)} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Btn title="Save" onPress={saveVehicleNumber} />
+              </View>
+            </View>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        visible={contactEditorOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setContactEditorOpen(false)}
+      >
+        <View style={s.vehicleModalBackdrop}>
+          <View style={s.vehicleModal}>
+            <Text style={s.rowTitle}>Add Emergency Contact</Text>
+            <Text style={[s.muted, { marginTop: 6 }]}>Add someone to contact in an emergency.</Text>
+            <View style={{ marginTop: 14 }}>
+              <Text style={s.label}>Name</Text>
+              <View style={s.inputWrap}>
+                <TextInput
+                  value={contactNameDraft}
+                  onChangeText={setContactNameDraft}
+                  placeholder="Contact name"
+                  placeholderTextColor={C.muted}
+                  maxLength={120}
+                  autoCapitalize="words"
+                  style={s.input}
+                  returnKeyType="next"
+                />
+              </View>
+            </View>
+            <View style={{ marginTop: 12 }}>
+              <Text style={s.label}>Phone number</Text>
+              <View style={s.inputWrap}>
+                <TextInput
+                  value={contactPhoneDraft}
+                  onChangeText={setContactPhoneDraft}
+                  placeholder="Phone number"
+                  placeholderTextColor={C.muted}
+                  maxLength={24}
+                  keyboardType="phone-pad"
+                  style={s.input}
+                  returnKeyType="done"
+                  onSubmitEditing={saveEmergencyContact}
+                />
+              </View>
+            </View>
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 14 }}>
+              <View style={{ flex: 1 }}>
+                <Btn title="Cancel" outline onPress={() => setContactEditorOpen(false)} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Btn title="Save Contact" onPress={saveEmergencyContact} />
+              </View>
+            </View>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        visible={peerPickerOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          setPeerPickerOpen(false);
+          void nearbyBluetooth.stopScan();
+          setBleScanning(false);
+        }}
+      >
+        <View style={s.vehicleModalBackdrop}>
+          <View style={[s.vehicleModal, { maxHeight: '80%' }]}>
+            <Text style={s.rowTitle}>Add Nearby Device</Text>
+            <Text style={[s.muted, { marginTop: 6 }]}>
+              Select a SafePath AI device that is currently advertising over Bluetooth.
+            </Text>
+            {Platform.OS !== 'android' ? (
+              <Text style={[s.muted, { color: C.orange, marginTop: 12 }]}>
+                Bluetooth connections require the Android app build.
+              </Text>
+            ) : null}
+            {bleError ? <Text style={[s.muted, { color: C.red, marginTop: 10 }]}>{bleError}</Text> : null}
+            {bleScanning ? (
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 16 }}>
+                <ActivityIndicator color={C.blueLight} />
+                <Text style={s.muted}>Searching nearby for 12 seconds…</Text>
+              </View>
+            ) : nearbyBlePeers.length === 0 ? (
+              <Text style={[s.muted, { marginTop: 16 }]}>No compatible devices found. Both phones must have this screen open.</Text>
+            ) : null}
+            <ScrollView style={{ marginTop: 10, flexGrow: 0 }}>
+              {nearbyBlePeers
+                .filter((peer) => !savedBlePeers.some((savedPeer) => savedPeer.id === peer.id))
+                .map((peer) => (
+                  <View key={peer.id} style={s.row}>
+                    <Text style={s.rowIcon}>📍</Text>
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.rowTitle}>{peer.name}</Text>
+                      <Text style={s.muted}>Bluetooth signal {peer.rssi} dBm</Text>
+                    </View>
+                    <Pressable onPress={() => { void connectToBluetoothPeer(peer); }} hitSlop={8}>
+                      <Text style={{ color: C.blueLight }}>Connect</Text>
+                    </Pressable>
+                  </View>
+                ))}
+            </ScrollView>
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 14 }}>
+              <View style={{ flex: 1 }}>
+                <Btn
+                  title={bleScanning ? 'Searching…' : 'Scan Again'}
+                  outline
+                  disabled={bleScanning || Platform.OS !== 'android'}
+                  onPress={() => { void scanForBluetoothPeers(); }}
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Btn
+                  title="Done"
+                  onPress={() => {
+                    setPeerPickerOpen(false);
+                    void nearbyBluetooth.stopScan();
+                    setBleScanning(false);
+                  }}
+                />
+              </View>
+            </View>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        visible={broadcastModalOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setBroadcastModalOpen(false)}
+      >
+        <View style={s.vehicleModalBackdrop}>
+          <View style={s.vehicleModal}>
+            <Text style={s.rowTitle}>Broadcast Message</Text>
+            <Text style={[s.muted, { marginTop: 6 }]}>
+              Send a help message to {savedBlePeers.filter((peer) => peer.connected).length} connected SafePath device(s).
+            </Text>
+            <View style={[s.inputWrap, { minHeight: 110, alignItems: 'flex-start', marginTop: 14 }]}>
+              <TextInput
+                value={broadcastDraft}
+                onChangeText={setBroadcastDraft}
+                placeholder="Type a message asking for help"
+                placeholderTextColor={C.muted}
+                maxLength={1000}
+                multiline
+                textAlignVertical="top"
+                style={[s.input, { minHeight: 92 }]}
+              />
+            </View>
+            <Text style={[s.muted, { marginTop: 8 }]}>Sent directly over Bluetooth. Avoid including passwords or sensitive personal information.</Text>
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 14 }}>
+              <View style={{ flex: 1 }}>
+                <Btn title="Cancel" outline onPress={() => setBroadcastModalOpen(false)} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Btn
+                  title={broadcastSending ? 'Sending…' : 'Send Help Message'}
+                  disabled={broadcastSending}
+                  danger
+                  onPress={() => { void sendBroadcastMessage(); }}
+                />
+              </View>
+            </View>
+          </View>
+        </View>
+      </Modal>
       {showHeader ? (
-        <View style={s.header}>
+        <View style={[s.header, ['trip', 'offline', 'profile', 'community', 'sos', 'comm', 'route', 'emergency'].includes(screen) && { marginTop: 24 }, screen === 'settings' && { marginTop: 36 }]}>
           <Pressable onPress={back} hitSlop={12}><Text style={s.backArrow}>←</Text></Pressable>
           <Text style={s.headerTitle}>{TITLES[screen]}</Text>
           <View style={{ width: 24 }} />
         </View>
       ) : null}
-      <ScrollView contentContainerStyle={[s.content, showTabs && { paddingBottom: 96 }]} keyboardShouldPersistTaps="handled">
-        {content()}
-      </ScrollView>
+      {screen === 'navigate' || screen === 'navigate2' ? (
+        <View style={[s.content, { flex: 1, paddingBottom: 96 }]}>
+          {content()}
+        </View>
+      ) : (
+        <ScrollView
+          contentContainerStyle={[s.content, showTabs && { paddingBottom: 96 }]}
+          keyboardShouldPersistTaps="handled"
+          refreshControl={screen === 'community' ? <RefreshControl refreshing={communityLoading} onRefresh={loadCommunityReports} tintColor={C.blueLight} /> : undefined}
+        >
+          {content()}
+        </ScrollView>
+      )}
+      {screen === 'offline' ? (
+        <Pressable onPress={() => go('sos')} style={s.offlineSosFab} accessibilityRole="button" accessibilityLabel="Emergency SOS">
+          <Text style={s.offlineSosText}>SOS</Text>
+        </Pressable>
+      ) : null}
       {showTabs ? (
         <View style={s.bottomNav}>
           {TABS.map((t) => {
@@ -968,6 +2288,19 @@ const s = StyleSheet.create({
 
   section: { color: C.white, fontSize: 15, fontWeight: '700', marginTop: 20, marginBottom: 10 },
   group: { backgroundColor: C.panel, borderRadius: 11, borderWidth: 1, borderColor: C.border, overflow: 'hidden', marginTop: 12 },
+  placeSuggestion: { backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, borderRadius: 8, padding: 10, marginTop: 6 },
+  tripStop: { flexDirection: 'row', alignItems: 'flex-start', gap: 8 },
+  tripStopActions: { flexDirection: 'row', gap: 10, marginTop: 42, alignItems: 'center' },
+  tripAction: { color: C.blueLight, fontSize: 20, fontWeight: '700', paddingHorizontal: 2 },
+  disabledText: { opacity: 0.3 },
+  vehicleGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  tripChoice: { width: '48%', minHeight: 72, alignItems: 'center', justifyContent: 'center', gap: 5, backgroundColor: C.panel, borderRadius: 10, borderWidth: 1, borderColor: C.border, padding: 10 },
+  tripChoiceActive: { borderColor: C.blue, backgroundColor: C.panel2 },
+  preferenceGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  preferenceChoice: { width: '48%', minHeight: 86, backgroundColor: C.panel, borderRadius: 10, borderWidth: 1, borderColor: C.border, padding: 10 },
+  tripError: { color: '#FF9A9A', fontSize: 13, marginTop: 12 },
+  tripMap: { height: 320, borderRadius: 14, overflow: 'hidden', marginTop: 8 },
+  routeOption: { backgroundColor: C.panel, borderRadius: 10, borderWidth: 1, borderColor: C.border, padding: 12, marginTop: 8 },
   row: { minHeight: 50, paddingHorizontal: 14, paddingVertical: 10, flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderBottomColor: C.border },
   rowIcon: { color: C.orange, fontSize: 16, width: 30 },
   rowTitle: { color: C.white, fontSize: 14, fontWeight: '500' },
@@ -995,10 +2328,6 @@ const s = StyleSheet.create({
   pin: { position: 'absolute', fontSize: 20 },
   userDot: { position: 'absolute', bottom: 40, left: '44%', width: 46, height: 46, borderRadius: 23, backgroundColor: C.blue, alignItems: 'center', justifyContent: 'center', borderWidth: 3, borderColor: '#B7BCFF' },
 
-  turn: { flexDirection: 'row', alignItems: 'center', gap: 14, backgroundColor: C.panel, borderRadius: 10, borderWidth: 1, borderColor: C.border, padding: 14 },
-  turnArrow: { color: C.white, fontSize: 34 },
-  turnTitle: { color: C.white, fontSize: 20, fontWeight: '500' },
-  alertChip: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.panel, borderRadius: 10, borderWidth: 1, borderColor: C.border, padding: 10, alignSelf: 'flex-start', minWidth: 160 },
   etaBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: C.bg2, borderRadius: 12, borderWidth: 1, borderColor: C.border, padding: 14, marginTop: 12 },
   etaBig: { color: C.white, fontSize: 19, fontWeight: '700' },
   exit: { backgroundColor: C.red, borderRadius: 8, paddingHorizontal: 22, paddingVertical: 12 },
@@ -1031,12 +2360,23 @@ const s = StyleSheet.create({
   countText: { color: C.red, fontSize: 60, fontWeight: '500' },
 
   report: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.panel, borderRadius: 11, borderWidth: 1, borderColor: C.border, padding: 14, marginTop: 10 },
+  vehicleModalBackdrop: { flex: 1, backgroundColor: 'rgba(4,7,20,0.82)', justifyContent: 'center', padding: 20 },
+  vehicleModal: { backgroundColor: C.bg2, borderRadius: 12, borderWidth: 1, borderColor: C.border, padding: 16 },
+  contactCard: { backgroundColor: C.panel, borderRadius: 10, borderWidth: 1, borderColor: C.border, padding: 12, marginTop: 8 },
+  reportModalBackdrop: { position: 'absolute', left: -18, right: -18, top: -18, bottom: 0, backgroundColor: 'rgba(4,7,20,0.82)', justifyContent: 'center', padding: 18 },
+  reportModal: { backgroundColor: C.bg2, borderRadius: 12, borderWidth: 1, borderColor: C.border, padding: 16, marginTop: 204 },
+  reportTypeGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10, marginBottom: 12 },
+  reportTypeChip: { width: '48%', backgroundColor: C.panel, borderRadius: 8, borderWidth: 1, borderColor: C.border, paddingVertical: 10, alignItems: 'center' },
+  reportPhoto: { width: '100%', height: 180, borderRadius: 10, marginBottom: 8, backgroundColor: C.panel },
+  reportDescription: { minHeight: 72, marginVertical: 12, borderRadius: 9, borderWidth: 1, borderColor: C.border, backgroundColor: C.panel, color: C.white, padding: 12, textAlignVertical: 'top' },
   fab: { alignSelf: 'flex-end', backgroundColor: '#6B44DB', borderRadius: 24, paddingHorizontal: 20, paddingVertical: 12, marginTop: 16 },
 
   segment: { flexDirection: 'row', backgroundColor: C.bg2, borderRadius: 8, marginTop: 10, padding: 3 },
   seg: { flex: 1, alignItems: 'center', paddingVertical: 8, borderRadius: 6 },
   skip: { backgroundColor: C.panel, borderRadius: 9, borderWidth: 1, borderColor: C.border, paddingHorizontal: 18, justifyContent: 'center' },
 
+  offlineSosFab: { position: 'absolute', right: 18, bottom: 66, width: 52, height: 52, borderRadius: 26, backgroundColor: C.red, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: '#FF8A8A', elevation: 5 },
+  offlineSosText: { color: C.white, fontSize: 13, fontWeight: '800' },
   bottomNav: { position: 'absolute', bottom: 0, left: 0, right: 0, height: 72, backgroundColor: C.bg2, borderTopWidth: 1, borderTopColor: '#282D49', flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center' },
   navItem: { alignItems: 'center', padding: 4 },
   navIconWrap: { width: 42, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },
@@ -1044,6 +2384,14 @@ const s = StyleSheet.create({
   navLabel: { color: C.muted, fontSize: 10, marginTop: 2 },
 });
 
-function MapMock(_props: { variant?: 1 | 2; hazards?: boolean }) {
-  return <LiveMap apiUrl={API_URL} style={{ height: 420 }} />;
+function MapMock(props: { variant?: 1 | 2; hazards?: boolean; onRouteSummary?: (summary: RouteSummary | null) => void }) {
+  return <LiveMap apiUrl={API_URL} style={{ height: 585 }} showRoutePanel={false} onRouteSummary={props.onRouteSummary} />;
+}
+
+function isSavedPlace(value: unknown): value is SavedPlace {
+  if (!value || typeof value !== 'object') return false;
+  const place = value as Record<string, unknown>;
+  return typeof place.name === 'string'
+    && Number.isFinite(place.lat)
+    && Number.isFinite(place.lng);
 }

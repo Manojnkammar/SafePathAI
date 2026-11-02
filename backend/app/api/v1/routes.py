@@ -1,15 +1,42 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import get_session
 from app.db.models import SavedRoute
-from app.schemas import RouteRequest, RouteResponse
+from app.schemas import PlaceSuggestion, RouteRequest, RouteResponse, TripPlanRequest, TripPlanResponse
 from app.schemas_app import SavedRouteCreate, SavedRouteOut
 from app.services.fusion import active_hazards
 from app.services.routing import compute_routes
+from app.services.trip_planner import (
+    TripProviderError,
+    build_trip_response,
+    fetch_road_routes,
+    search_places,
+)
 
 router = APIRouter(prefix="/routes", tags=["routing"])
+
+
+@router.get("/places/search", response_model=list[PlaceSuggestion])
+async def search_trip_places(q: str = Query(min_length=2, max_length=200)):
+    query = q.strip()
+    if len(query) < 2:
+        raise HTTPException(status_code=422, detail="Search text must contain at least 2 characters.")
+    try:
+        return await search_places(query)
+    except TripProviderError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@router.post("/plan", response_model=TripPlanResponse)
+async def plan_trip(body: TripPlanRequest, session: AsyncSession = Depends(get_session)):
+    try:
+        routes = await fetch_road_routes(body)
+    except TripProviderError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    hazards = await active_hazards(session)
+    return build_trip_response(body, routes, hazards)
 
 
 @router.post("/safe", response_model=RouteResponse)

@@ -14,6 +14,8 @@ database_url = make_url(settings.database_url)
 
 if database_url.drivername in ("postgresql", "postgresql+asyncpg"):
     database_url = database_url.set(drivername="postgresql+psycopg")
+elif database_url.drivername == "sqlite+aiosqlite":
+    database_url = database_url.set(drivername="sqlite")
 
 config.set_main_option(
     "sqlalchemy.url",

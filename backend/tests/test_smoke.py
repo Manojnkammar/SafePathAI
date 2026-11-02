@@ -40,6 +40,33 @@ def test_full_flow():
         hz = c.get(f"{P}/hazards/active").json()
         assert len(hz) == 2
 
+        # Community report lifecycle and duplicate vote protection
+        pothole = c.post(f"{P}/reports", json={
+            "lat": 12.976, "lng": 77.596, "incident_type": "pothole",
+            "description": "Large pothole near the intersection", "user_id": "mobile-u1",
+        })
+        assert pothole.status_code == 201, pothole.text
+        report_id = pothole.json()["id"]
+        assert pothole.json()["incident_type"] == "pothole"
+        vote = c.post(f"{P}/reports/{report_id}/vote", json={"user_id": "voter-u1", "vote": "up"})
+        assert vote.status_code == 200, vote.text
+        assert vote.json()["upvotes"] == 1
+        duplicate = c.post(f"{P}/reports/{report_id}/vote", json={"user_id": "voter-u1", "vote": "down"})
+        assert duplicate.status_code == 409
+        verify = c.post(f"{P}/reports/{report_id}/verify")
+        assert verify.status_code == 200
+        bad_vote = c.post(f"{P}/reports/{report_id}/vote", json={"user_id": "voter-u1", "vote": "down"})
+        assert bad_vote.status_code == 409
+        resolve = c.post(f"{P}/reports/{report_id}/resolve", json={"resolved": True})
+        assert resolve.status_code == 200
+        assert resolve.json()["resolved"] is True
+
+        area = c.get(f"{P}/reports/area?min_lat=12&min_lng=77&max_lat=13&max_lng=78")
+        assert area.status_code == 200
+
+        reject_upload = c.post(f"{P}/reports/upload", files={"file": ("note.txt", b"not an image", "text/plain")})
+        assert reject_upload.status_code == 415
+
         # Routing must avoid the hazard that the fastest route crosses
         body = {"origin": {"lat": 12.96, "lng": 77.58}, "destination": {"lat": 12.99, "lng": 77.61}, "k": 3}
         r = c.post(f"{P}/routes/safe", json=body)
@@ -57,3 +84,50 @@ def test_full_flow():
         assert r.status_code == 200
         assert r.json()["source"] == "fallback"
         assert "112" in r.json()["answer"]
+
+
+def test_user_password_signup_and_login():
+    payload = {
+        "email": "password-user@example.com",
+        "display_name": "Password User",
+        "password": "SafePath9!",
+        "password_confirmation": "SafePath9!",
+    }
+    with TestClient(app) as c:
+        created = c.post(f"{P}/users", json=payload)
+        assert created.status_code == 201, created.text
+        assert "password_hash" not in created.json()
+
+        login = c.post(f"{P}/users/login", json={"email": payload["email"], "password": payload["password"]})
+        assert login.status_code == 200, login.text
+        assert login.json()["id"] == created.json()["id"]
+
+        wrong_password = c.post(f"{P}/users/login", json={"email": payload["email"], "password": "WrongPass9!"})
+        assert wrong_password.status_code == 401
+
+        weak_password = {**payload, "email": "weak-user@example.com", "password": "123!", "password_confirmation": "123!"}
+        assert c.post(f"{P}/users", json=weak_password).status_code == 422
+
+        common_password = {**payload, "email": "common-user@example.com", "password": "Password1!", "password_confirmation": "Password1!"}
+        assert c.post(f"{P}/users", json=common_password).status_code == 422
+
+        mismatched_password = {**payload, "email": "mismatch-user@example.com", "password_confirmation": "Different9!"}
+        assert c.post(f"{P}/users", json=mismatched_password).status_code == 422
+
+        invalid_passwords = [
+            "Pass1!a",
+            "a" * 62 + "A1!",
+            "passcode1!",
+            "PASSCODE1!",
+            "Passcode!!",
+            "Passcode12",
+            "Pass word1!",
+        ]
+        for index, invalid_password in enumerate(invalid_passwords):
+            invalid_payload = {
+                **payload,
+                "email": f"invalid-password-{index}@example.com",
+                "password": invalid_password,
+                "password_confirmation": invalid_password,
+            }
+            assert c.post(f"{P}/users", json=invalid_payload).status_code == 422
