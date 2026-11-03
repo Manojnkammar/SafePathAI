@@ -21,13 +21,13 @@ function Header({ title }: { title: string }) {
   );
 }
 function TabBar({ active = 0 }: { active?: number }) {
-  const icons = [Home, Map, ClipboardList, Bell, User];
+  const icons = ["⌂", "⌖", "▣", "🔔", "◉"];
   const labels = ["Home", "Map", "Trips", "Alerts", "Profile"];
   return (
     <div className="mt-auto flex h-11 shrink-0 items-center justify-around border-t border-border bg-screen">
-      {icons.map((I, i) => (
+      {icons.map((icon, i) => (
         <div key={i} className={`flex flex-col items-center gap-0.5 rounded-full p-1 ${i === active ? "bg-surface-2 text-foreground" : "text-muted-foreground"}`}>
-          <I className="h-4 w-4" />
+          <span className="flex h-4 w-4 items-center justify-center text-[14px] leading-none">{icon}</span>
           <span className="text-[6px]">{labels[i]}</span>
         </div>
       ))}

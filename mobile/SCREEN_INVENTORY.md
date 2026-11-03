@@ -30,7 +30,19 @@ The Expo application implements all 16 Lovable screens as native views.
 ## Configuration
 
 - Expo Android package: `com.safepathai.mobile`
-- API base URL: `EXPO_PUBLIC_API_URL`, defaulting to `http://localhost:8000/api/v1`
+- API base URL: `EXPO_PUBLIC_API_URL`; development builds infer the host when possible
 - Android run command: `npm.cmd run android`
 - TypeScript check: `npm.cmd run typecheck`
 - Android export: `npm.cmd run export:android`
+
+### Login and signup
+
+Email/password login and account creation use the FastAPI backend. Guest mode works without it, but login and signup require the backend to be running:
+
+1. Start the API from the repository root:
+   ```powershell
+   cd backend
+   .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+   ```
+2. For a physical Android device, copy `mobile/.env.example` to `mobile/.env` and replace the example IP with the computer's LAN IP. The phone and computer must be on the same network.
+3. Restart Expo after changing `.env` so the URL is loaded by the app.

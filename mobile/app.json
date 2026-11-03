@@ -11,7 +11,10 @@
     "android": {
       "package": "com.safepathai.mobile",
       "softwareKeyboardLayoutMode": "pan",
+      "usesCleartextTraffic": true,
       "permissions": [
+        "INTERNET",
+        "SEND_SMS",
         "CAMERA",
         "READ_MEDIA_IMAGES",
         "ACCESS_FINE_LOCATION",

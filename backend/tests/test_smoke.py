@@ -131,3 +131,19 @@ def test_user_password_signup_and_login():
                 "password_confirmation": invalid_password,
             }
             assert c.post(f"{P}/users", json=invalid_payload).status_code == 422
+
+
+def test_report_owner_can_delete_report():
+    with TestClient(app) as c:
+        created = c.post(f"{P}/reports", json={
+            "user_id": "report-owner",
+            "incident_type": "pothole",
+            "lat": 12.97,
+            "lng": 77.59,
+        })
+        assert created.status_code == 201, created.text
+        report_id = created.json()["id"]
+        assert created.json()["user_id"] == "report-owner"
+        assert c.delete(f"{P}/reports/{report_id}?user_id=other-user").status_code == 403
+        assert c.delete(f"{P}/reports/{report_id}?user_id=report-owner").status_code == 204
+        assert c.get(f"{P}/reports/{report_id}").status_code == 404

@@ -30,3 +30,7 @@ app.add_middleware(
 
 app.include_router(health_router, prefix=settings.api_prefix)
 app.include_router(api_router, prefix=settings.api_prefix)
+
+media_dir = Path("media")
+media_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/media", StaticFiles(directory=media_dir), name="media")

@@ -1,0 +1,13 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+group = 'expo.modules.safepathsms'
+version = '1.0.0'
+
+android {
+  namespace "expo.modules.safepathsms"
+}
+
+dependencies {
+  implementation project(':expo-modules-core')
+}

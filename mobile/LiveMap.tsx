@@ -1,11 +1,34 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View, ViewStyle } from 'react-native';
+import { ActivityIndicator, Alert, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View, ViewStyle } from 'react-native';
 import * as Location from 'expo-location';
 import { WebView } from 'react-native-webview';
 
 type Pt = { lat: number; lng: number };
 type Hazard = { id: string; incident_type: string; severity: string; lat: number; lng: number; radius_m: number };
 type RawRoute = { points: Pt[]; distance_m: number; duration_s: number };
+type DisplayRoute = RawRoute & { safety: number; hit: string[]; label: string; color: string };
+type PlaceResult = { lat: number; lng: number; name: string };
+export type NearbyPlace = { lat: number; lng: number; name: string; distance_m: number; category: string };
+
+function isBackendPlace(value: unknown): value is PlaceResult {
+  if (!value || typeof value !== 'object') return false;
+  return 'lat' in value
+    && typeof value.lat === 'number'
+    && 'lng' in value
+    && typeof value.lng === 'number'
+    && 'name' in value
+    && typeof value.name === 'string';
+}
+
+function isNominatimPlace(value: unknown): value is { lat: string; lon: string; display_name: string } {
+  if (!value || typeof value !== 'object') return false;
+  return 'lat' in value
+    && typeof value.lat === 'string'
+    && 'lon' in value
+    && typeof value.lon === 'string'
+    && 'display_name' in value
+    && typeof value.display_name === 'string';
+}
 
 export type PlannedRoute = {
   points: Pt[];
@@ -31,6 +54,7 @@ type Props = {
   plannedRoutes?: PlannedRoute[];
   plannedWaypoints?: Pt[];
   selectedRouteIndex?: number;
+  nearbyPlaces?: NearbyPlace[];
 };
 
 const BENGALURU: Pt = { lat: 12.9716, lng: 77.5946 };
@@ -68,6 +92,43 @@ function analyse(points: Pt[], hazards: Hazard[]) {
 const fmtDur = (s: number) =>
   s >= 3600 ? Math.floor(s / 3600) + ' h ' + Math.round((s % 3600) / 60) + ' min' : Math.max(1, Math.round(s / 60)) + ' min';
 const fmtDist = (m: number) => (m >= 1000 ? (m / 1000).toFixed(1) + ' km' : Math.round(m) + ' m');
+const ROUTE_COLORS = ['#22c55e', '#3b82f6', '#f59e0b'];
+
+function normalized(value: number, values: number[]) {
+  const low = Math.min(...values);
+  const high = Math.max(...values);
+  return high === low ? 0 : (value - low) / (high - low);
+}
+
+function rankAlternatives(raw: RawRoute[], hazards: Hazard[]): DisplayRoute[] {
+  const analysed = raw.map((route) => {
+    const analysis = analyse(route.points, hazards);
+    const safety = analysis.total ? Math.round(100 * (1 - analysis.exposed / analysis.total)) : 100;
+    return { ...route, safety, hit: analysis.hit };
+  });
+  if (!analysed.length) return [];
+
+  const distances = analysed.map((route) => route.distance_m);
+  const durations = analysed.map((route) => route.duration_s);
+  const suitability = analysed.map((route) => (
+    0.45 * (route.safety / 100)
+    + 0.30 * (1 - normalized(route.duration_s, durations))
+    + 0.25 * (1 - normalized(route.distance_m, distances))
+  ));
+  const shortest = distances.indexOf(Math.min(...distances));
+  const longest = distances.lastIndexOf(Math.max(...distances));
+  const best = suitability.indexOf(Math.max(...suitability));
+  const order: number[] = [];
+  for (const index of [shortest, best, longest, ...suitability.map((_, index) => index).sort((a, b) => suitability[b] - suitability[a])]) {
+    if (!order.includes(index)) order.push(index);
+  }
+
+  return order.slice(0, 3).map((index, displayIndex) => ({
+    ...analysed[index],
+    label: ['Shortest', 'Best', 'Longest'][displayIndex] ?? `Alternative ${displayIndex + 1}`,
+    color: ROUTE_COLORS[displayIndex] ?? '#94a3b8',
+  }));
+}
 
 /* ---------- route sources ---------- */
 async function osrmRoutes(a: Pt, b: Pt): Promise<RawRoute[]> {
@@ -116,6 +177,64 @@ async function backendRoutes(apiUrl: string, a: Pt, b: Pt): Promise<RawRoute[]> 
   });
 }
 
+function addRoadDurations(routes: RawRoute[], roadRoutes: RawRoute[]): RawRoute[] {
+  const fastestRoadDuration = roadRoutes.reduce(
+    (fastest, route) => Math.min(fastest, route.duration_s),
+    Number.POSITIVE_INFINITY,
+  );
+  const shortestDijkstraDistance = routes.reduce(
+    (shortest, route) => Math.min(shortest, route.distance_m),
+    Number.POSITIVE_INFINITY,
+  );
+  if (!Number.isFinite(fastestRoadDuration) || !Number.isFinite(shortestDijkstraDistance) || shortestDijkstraDistance <= 0) {
+    return routes;
+  }
+  return routes.map((route) => ({
+    ...route,
+    // Keep Dijkstra's hazard-aware distance, but calibrate ETA with a real road estimate.
+    duration_s: fastestRoadDuration * Math.max(1, route.distance_m / shortestDijkstraDistance),
+  }));
+}
+
+async function searchPlaces(apiUrl: string, query: string): Promise<PlaceResult[]> {
+  let backendError: unknown;
+  try {
+    const response = await fetch(`${apiUrl}/routes/places/search?q=${encodeURIComponent(query)}`);
+    if (!response.ok) throw new Error(`Place search failed (${response.status}).`);
+    const results: unknown = await response.json();
+    if (!Array.isArray(results)) throw new Error('Place search returned an invalid response.');
+    const places = results.filter(isBackendPlace);
+    if (places.length) return places;
+  } catch (error) {
+    backendError = error;
+  }
+
+  try {
+    const response = await fetch(
+      'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&countrycodes=in&q='
+        + encodeURIComponent(query),
+      { headers: { 'Accept-Language': 'en' } },
+    );
+    if (!response.ok) throw new Error(`Place search failed (${response.status}).`);
+    const results: unknown = await response.json();
+    if (!Array.isArray(results)) throw new Error('Place search returned an invalid response.');
+    return results
+      .filter(isNominatimPlace)
+      .map((place) => ({
+        lat: Number(place.lat),
+        lng: Number(place.lon),
+        name: place.display_name.split(',').slice(0, 2).join(',').trim(),
+      }))
+      .filter((place) => Number.isFinite(place.lat) && Number.isFinite(place.lng));
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'Place search is unavailable.';
+    if (backendError instanceof Error) {
+      throw new Error(`${reason} Backend search: ${backendError.message}`);
+    }
+    throw error;
+  }
+}
+
 /* ---------- the map page (Leaflet + OpenStreetMap data) ---------- */
 function buildHtml(dark: boolean) {
   const tile = dark
@@ -128,14 +247,15 @@ function buildHtml(dark: boolean) {
 <style>
 html,body,#map{height:100%;margin:0;background:#0b1220}
 .leaflet-container{font-family:-apple-system,Roboto,sans-serif}
-.leaflet-top.leaflet-left{top:72px}
+.leaflet-top.leaflet-left{top:118px}
 .me{width:18px;height:18px;border-radius:50%;background:#3b82f6;border:3px solid #fff;box-shadow:0 0 0 6px rgba(59,130,246,.3)}
 .pin{width:22px;height:22px;border-radius:50% 50% 50% 0;background:#ef4444;border:2px solid #fff;transform:rotate(-45deg)}
 .waypoint{width:26px;height:26px;border-radius:13px;background:#16a34a;border:2px solid #fff;color:#fff;font-weight:700;font-size:12px;line-height:22px;text-align:center;box-shadow:0 1px 5px #000}
+.nearby{width:24px;height:24px;border-radius:50%;background:#f59e0b;border:2px solid #fff;color:#111827;font-weight:700;font-size:14px;line-height:20px;text-align:center;box-shadow:0 1px 5px #000}
 </style></head><body><div id="map"></div><script>
 var map=L.map('map',{zoomControl:true,zoomAnimation:true}).setView([12.9716,77.5946],13);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,subdomains:'abcd',attribution:'&copy; OpenStreetMap &copy; CARTO'}).addTo(map);
-var layer=L.layerGroup().addTo(map),userMk=null,centered=false,lastFocus=0,lastKey='';
+var layer=L.layerGroup().addTo(map),userMk=null,startMk=null,centered=false,lastFocus=0,lastKey='';
 var COLORS={low:'#facc15',medium:'#fb923c',high:'#ef4444',critical:'#b91c1c'};
 function post(o){var s=JSON.stringify(o);
   if(window.ReactNativeWebView){window.ReactNativeWebView.postMessage(s);}
@@ -152,15 +272,19 @@ window.__update=function(s){
   var routes=s.routes||[],bounds=null;
   routes.forEach(function(r,i){
     if(i===s.sel)return;
-    L.polyline(r.points,{color:'#94a3b8',weight:5,opacity:.7,dashArray:'8 8'}).addTo(layer);
+    L.polyline(r.points,{color:r.color||'#94a3b8',weight:5,opacity:.65}).addTo(layer);
   });
   if(routes[s.sel]){
-    var pl=L.polyline(routes[s.sel].points,{color:'#3b82f6',weight:7}).addTo(layer);
+    var pl=L.polyline(routes[s.sel].points,{color:routes[s.sel].color||'#3b82f6',weight:7,opacity:1}).addTo(layer);
     bounds=pl.getBounds();
   }
   if(s.dest&&!(s.waypoints||[]).length){
     L.marker([s.dest.lat,s.dest.lng],{icon:L.divIcon({className:'',html:'<div class="pin"></div>',iconSize:[22,22],iconAnchor:[11,22]})}).addTo(layer);
   }
+  (s.nearbyPlaces||[]).forEach(function(p){
+    L.marker([p.lat,p.lng],{icon:L.divIcon({className:'',html:'<div class="nearby">+</div>',iconSize:[24,24],iconAnchor:[12,12]})})
+      .bindPopup('<b>'+p.name+'</b><br>'+Math.round(p.distance_m)+' m away').addTo(layer);
+  });
   (s.waypoints||[]).forEach(function(p,i){
     var label=i===0?'A':i===s.waypoints.length-1?'B':String(i);
     L.marker([p.lat,p.lng],{icon:L.divIcon({className:'',html:'<div class="waypoint">'+label+'</div>',iconSize:[28,28],iconAnchor:[14,14]})}).addTo(layer);
@@ -172,6 +296,10 @@ window.__update=function(s){
       if(!(s.waypoints||[]).length){map.setView([s.user.lat,s.user.lng],14);}
       centered=true;
     }
+  }
+  if(s.start){
+    if(startMk){startMk.setLatLng([s.start.lat,s.start.lng]);}
+    else{startMk=L.marker([s.start.lat,s.start.lng],{icon:L.divIcon({className:'',html:'<div class="waypoint">A</div>',iconSize:[28,28],iconAnchor:[14,14]})}).addTo(map);}
   }
   var selected=routes[s.sel],start=selected&&selected.points[0],end=selected&&selected.points[selected.points.length-1];
   var key=routes.length+':'+s.sel+':'+(selected?selected.points.length:0)+':'+(start?start.join(','):'')+':'+(end?end.join(','):'');
@@ -199,6 +327,7 @@ export default function LiveMap({
   plannedRoutes,
   plannedWaypoints = [],
   selectedRouteIndex = 0,
+  nearbyPlaces = [],
 }: Props) {
   const html = useMemo(() => buildHtml(dark), [dark]);
   const webRef = useRef<any>(null);
@@ -208,17 +337,27 @@ export default function LiveMap({
 
   const [hazards, setHazards] = useState<Hazard[]>([]);
   const [user, setUser] = useState<Pt | null>(null);
+  const [startMode, setStartMode] = useState<'current' | 'custom'>('current');
+  const [startSelected, setStartSelected] = useState(false);
+  const [startPlace, setStartPlace] = useState<PlaceResult | null>(null);
+  const [startQuery, setStartQuery] = useState('');
+  const [startSearching, setStartSearching] = useState(false);
   const [dest, setDest] = useState<Pt | null>(destination);
   const [destName, setDestName] = useState('');
   const [raw, setRaw] = useState<RawRoute[]>([]);
   const [sel, setSel] = useState(0);
   const [focus, setFocus] = useState(0);
   const [query, setQuery] = useState('');
+  const [searching, setSearching] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
-  const origin = user ?? initialCenter;
-  const originKey = origin.lat.toFixed(4) + ',' + origin.lng.toFixed(4);
+  const origin = !startSelected
+    ? null
+    : startMode === 'custom'
+      ? startPlace
+      : user;
+  const originKey = origin ? origin.lat.toFixed(4) + ',' + origin.lng.toFixed(4) : 'unset';
 
   useEffect(() => {
     if (destination) setDest(destination);
@@ -229,11 +368,19 @@ export default function LiveMap({
     (async () => {
       try {
         const p = await Location.requestForegroundPermissionsAsync();
-        if (p.status !== 'granted') return;
-        const pos = await Location.getCurrentPositionAsync({});
+        if (p.status !== 'granted') {
+          Alert.alert('Location permission required', 'Choose a starting point manually or allow location access to use your current location.');
+          return;
+        }
+        const pos = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.BestForNavigation,
+        });
         setUser({ lat: pos.coords.latitude, lng: pos.coords.longitude });
-      } catch {
-        /* no GPS: the map just uses the default centre */
+      } catch (error) {
+        Alert.alert(
+          'Current location unavailable',
+          error instanceof Error ? `${error.message} Choose a starting point manually.` : 'Choose a starting point manually.',
+        );
       }
     })();
   }, []);
@@ -255,7 +402,7 @@ export default function LiveMap({
 
   /* fetch road routes when the destination changes */
   useEffect(() => {
-    if (!dest) {
+    if (!dest || (!origin && plannedRoutes === undefined)) {
       setRaw([]);
       return;
     }
@@ -270,6 +417,11 @@ export default function LiveMap({
       setBusy(false);
       return;
     }
+    if (!origin) {
+      setRaw([]);
+      return;
+    }
+    const routeOrigin = origin;
     let cancel = false;
     setBusy(true);
     setError('');
@@ -277,9 +429,13 @@ export default function LiveMap({
       try {
         let r: RawRoute[];
         try {
-          r = await osrmRoutes(origin, dest);
+          r = await osrmRoutes(routeOrigin, dest);
         } catch {
-          r = await backendRoutes(apiUrl, origin, dest);
+          if (!cancel) {
+            setRaw([]);
+            setError('Accurate road routing is unavailable. Please check your connection and try again.');
+          }
+          return;
         }
         if (!cancel) {
           setRaw(r);
@@ -300,20 +456,20 @@ export default function LiveMap({
   }, [dest?.lat, dest?.lng, originKey, apiUrl, plannedRoutes, selectedRouteIndex]);
 
   /* score every route against the active hazards; safest first */
-  const routes = useMemo(
-    () => raw.map((route) => {
+  const routes = useMemo(() => {
+    if (plannedRoutes === undefined) return rankAlternatives(raw, hazards);
+    return raw.map((route, index) => {
       const analysis = analyse(route.points, hazards);
-      const safety = analysis.total ? Math.round(100 * (1 - analysis.exposed / analysis.total)) : 100;
-      return { ...route, safety, hit: analysis.hit };
-    }),
-    [raw, hazards],
-  );
-  const displayedRoutes = useMemo(
-    () => plannedRoutes === undefined
-      ? [...routes].sort((x, y) => y.safety - x.safety || x.duration_s - y.duration_s)
-      : routes,
-    [plannedRoutes, routes],
-  );
+      return {
+        ...route,
+        safety: analysis.total ? Math.round(100 * (1 - analysis.exposed / analysis.total)) : 100,
+        hit: analysis.hit,
+        label: index === 0 ? 'Best' : `Alternative ${index}`,
+        color: ROUTE_COLORS[index] ?? '#94a3b8',
+      };
+    });
+  }, [raw, hazards, plannedRoutes]);
+  const displayedRoutes = useMemo(() => routes, [routes]);
   const cur = Math.min(plannedRoutes === undefined ? sel : selectedRouteIndex, Math.max(0, displayedRoutes.length - 1));
   const chosen = displayedRoutes[cur];
 
@@ -342,13 +498,19 @@ export default function LiveMap({
     () => ({
       hazards,
       user,
+      start: origin,
       dest,
-      routes: displayedRoutes.map((r) => ({ points: r.points.map((p) => [p.lat, p.lng]), safety: r.safety })),
+      routes: displayedRoutes.map((r) => ({
+        points: r.points.map((p) => [p.lat, p.lng]),
+        safety: r.safety,
+        color: r.color,
+      })),
       waypoints: plannedWaypoints,
       sel: cur,
       focus,
+      nearbyPlaces,
     }),
-    [hazards, user, dest, displayedRoutes, plannedWaypoints, cur, focus],
+    [hazards, user, origin, dest, displayedRoutes, plannedWaypoints, cur, focus, nearbyPlaces],
   );
   const push = useCallback(() => {
     const json = JSON.stringify(mapState);
@@ -384,30 +546,112 @@ export default function LiveMap({
   }, [handleMsg]);
 
   async function search() {
-    if (!query.trim()) return;
-    setBusy(true);
-    setRaw([]);
-    setSel(0);
+    const searchQuery = query.trim();
+    if (searchQuery.length < 2 || searching) return;
+    setSearching(true);
     setError('');
-    onRouteSummary?.(null);
     try {
-      const r = await fetch(
-        'https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=in&q=' + encodeURIComponent(query),
-      );
-      const j = await r.json();
-      if (!j.length) {
+      const places = await searchPlaces(apiUrl, searchQuery);
+      if (!places.length) {
         setError('Place not found.');
+        Alert.alert('Place not found', `No location matched "${searchQuery}".`);
         return;
       }
-      const p = { lat: parseFloat(j[0].lat), lng: parseFloat(j[0].lon) };
-      const name = String(j[0].display_name).split(',').slice(0, 2).join(',');
+      const { lat, lng, name } = places[0];
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        setError('Place search returned invalid coordinates.');
+        return;
+      }
+      const p = { lat, lng };
       setDest(p);
       setDestName(name);
+      setQuery(name);
+      setRaw([]);
+      setSel(0);
+      onRouteSummary?.(null);
       cbRef.current?.(p, name);
-    } catch {
-      setError('Search failed. Check your internet connection.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Search failed. Check your internet connection.';
+      setError(message);
+      Alert.alert('Search failed', message);
     } finally {
-      setBusy(false);
+      setSearching(false);
+    }
+  }
+
+  async function searchStart() {
+    const searchQuery = startQuery.trim();
+    if (searchQuery.length < 2 || startSearching) return;
+    setStartSearching(true);
+    setError('');
+    try {
+      const places = await searchPlaces(apiUrl, searchQuery);
+      if (!places.length) {
+        setError('Starting location not found.');
+        Alert.alert('Starting location not found', `No location matched "${searchQuery}".`);
+        return;
+      }
+      const place = places[0];
+      setStartPlace(place);
+      setStartMode('custom');
+      setStartSelected(true);
+      setStartQuery(place.name);
+      setDest(null);
+      setDestName('');
+      setQuery('');
+      setRaw([]);
+      onRouteSummary?.(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Starting location search failed.';
+      setError(message);
+      Alert.alert('Starting location search failed', message);
+    } finally {
+      setStartSearching(false);
+    }
+  }
+
+  function chooseStartingPoint() {
+    setStartMode('custom');
+    setStartSelected(false);
+    setStartPlace(null);
+    setStartQuery('');
+    setDest(null);
+    setDestName('');
+    setQuery('');
+    setRaw([]);
+    setError('');
+    onRouteSummary?.(null);
+  }
+
+  async function useCurrentLocation() {
+    try {
+      let current = user;
+      if (!current) {
+        const permission = await Location.requestForegroundPermissionsAsync();
+        if (permission.status !== 'granted') {
+          throw new Error('Location permission is required to use your current location.');
+        }
+        const position = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.BestForNavigation,
+        });
+        current = { lat: position.coords.latitude, lng: position.coords.longitude };
+        setUser(current);
+      }
+      setStartMode('current');
+      setStartPlace(null);
+      setStartQuery('');
+      setStartSelected(true);
+      setError('');
+      setDest(null);
+      setDestName('');
+      setQuery('');
+      setRaw([]);
+      onRouteSummary?.(null);
+    } catch (error) {
+      Alert.alert(
+        'Current location unavailable',
+        error instanceof Error ? error.message : 'Allow location access and try again.',
+      );
     }
   }
 
@@ -442,20 +686,58 @@ export default function LiveMap({
         />
       )}
 
-      {showSearch && (
-        <View style={st.searchRow}>
-          <TextInput
-            value={query}
-            onChangeText={setQuery}
-            onSubmitEditing={search}
-            placeholder="Search a place, or tap the map"
-            placeholderTextColor="#94a3b8"
-            style={st.input}
-            returnKeyType="search"
-          />
-          <Pressable style={st.goBtn} onPress={search}>
-            <Text style={st.goTxt}>Go</Text>
-          </Pressable>
+      {showSearch && (!startSelected || !dest) && (
+        <View style={st.searchPanel}>
+          {!startSelected ? (
+            <View style={st.startChoiceRow}>
+              <Pressable
+                style={[st.startChoice, startMode === 'current' && st.startChoiceActive]}
+                onPress={useCurrentLocation}
+              >
+                <Text style={st.startChoiceText}>Use current location</Text>
+              </Pressable>
+              <Pressable
+                style={[st.startChoice, startMode === 'custom' && st.startChoiceActive]}
+                onPress={chooseStartingPoint}
+              >
+                <Text style={st.startChoiceText}>Choose starting point</Text>
+              </Pressable>
+            </View>
+          ) : null}
+          {!startSelected && startMode === 'custom' ? (
+            <View style={st.searchRow}>
+              <TextInput
+                value={startQuery}
+                onChangeText={setStartQuery}
+                onSubmitEditing={searchStart}
+                placeholder="Enter starting location"
+                placeholderTextColor="#94a3b8"
+                style={st.input}
+                returnKeyType="search"
+                editable={!startSearching}
+              />
+              <Pressable style={[st.goBtn, startSearching && { opacity: 0.6 }]} onPress={searchStart} disabled={startSearching}>
+                <Text style={st.goTxt}>{startSearching ? '...' : 'Set start'}</Text>
+              </Pressable>
+            </View>
+          ) : null}
+          {startSelected && !dest ? (
+            <View style={st.searchRow}>
+              <TextInput
+                value={query}
+                onChangeText={setQuery}
+                onSubmitEditing={search}
+                placeholder="Enter destination"
+                placeholderTextColor="#94a3b8"
+                style={st.input}
+                returnKeyType="search"
+                editable={!searching}
+              />
+              <Pressable style={[st.goBtn, searching && { opacity: 0.6 }]} onPress={search} disabled={searching}>
+                <Text style={st.goTxt}>{searching ? '...' : 'Go'}</Text>
+              </Pressable>
+            </View>
+          ) : null}
         </View>
       )}
 
@@ -468,7 +750,7 @@ export default function LiveMap({
         </Pressable>
       </View>
 
-      {busy && (
+      {(busy || searching || startSearching) && (
         <View style={st.busy}>
           <ActivityIndicator color="#fff" />
         </View>
@@ -491,7 +773,7 @@ export default function LiveMap({
                 {displayedRoutes.map((r, i) => (
                   <Pressable key={i} onPress={() => setSel(i)} style={[st.chip, i === cur && st.chipOn]}>
                     <Text style={[st.chipTxt, i === cur && st.chipTxtOn]}>
-                      {(i === 0 ? 'Recommended' : 'Option ' + (i + 1)) + ': ' + fmtDur(r.duration_s)}
+                      {r.label + ': ' + fmtDur(r.duration_s)}
                     </Text>
                     <Text style={[st.chipSub, i === cur && st.chipTxtOn]}>
                       {fmtDist(r.distance_m) + ' | Safety ' + r.safety}
@@ -511,7 +793,32 @@ export default function LiveMap({
 const st = StyleSheet.create({
   box: { minHeight: 300, overflow: 'hidden', borderRadius: 16, backgroundColor: '#0b1220' },
   web: { ...StyleSheet.absoluteFill, backgroundColor: 'transparent' },
-  searchRow: { position: 'absolute', top: 10, left: 10, right: 10, flexDirection: 'row', gap: 8 },
+  searchPanel: {
+    position: 'absolute',
+    top: 10,
+    left: 10,
+    right: 10,
+    zIndex: 10,
+    elevation: 10,
+    gap: 6,
+  },
+  startChoiceRow: { flexDirection: 'row', gap: 6 },
+  startChoice: {
+    flex: 1,
+    backgroundColor: 'rgba(15,23,42,0.92)',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#334155',
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+    alignItems: 'center',
+  },
+  startChoiceActive: { backgroundColor: '#1d4ed8', borderColor: '#60a5fa' },
+  startChoiceText: { color: '#fff', fontSize: 11, fontWeight: '700', textAlign: 'center' },
+  searchRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
   input: {
     flex: 1, backgroundColor: 'rgba(15,23,42,0.92)', color: '#fff', borderRadius: 12,
     paddingHorizontal: 14, paddingVertical: 10, fontSize: 14,

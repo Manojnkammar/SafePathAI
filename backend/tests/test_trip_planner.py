@@ -167,6 +167,7 @@ def test_road_provider_receives_ordered_coordinates_and_returns_actual_legs(monk
             assert url.endswith("77.0,12.0;77.01,12.01;77.02,12.02")
             assert params["geometries"] == "geojson"
             assert params["alternatives"] == "true"
+            assert "exclude" not in params
             return FakeResponse()
 
     monkeypatch.setattr(trip_planner.httpx, "AsyncClient", lambda **_kwargs: FakeClient())
@@ -187,6 +188,53 @@ def test_road_provider_receives_ordered_coordinates_and_returns_actual_legs(monk
         ("Start", "Stop"),
         ("Stop", "Finish"),
     ]
+
+
+@pytest.mark.parametrize(
+    "vehicle",
+    ["bike", "car", "ev", "bus"],
+)
+def test_road_provider_does_not_send_unsupported_vehicle_exclusions(monkeypatch, vehicle):
+    seen = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "code": "Ok",
+                "routes": [{
+                    "distance": 1000,
+                    "duration": 120,
+                    "geometry": {"coordinates": [[77.0, 12.0], [77.01, 12.01]]},
+                    "legs": [{"distance": 1000, "duration": 120}],
+                }],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url, params):
+            seen.update(params)
+            return FakeResponse()
+
+    monkeypatch.setattr(trip_planner.httpx, "AsyncClient", lambda **_kwargs: FakeClient())
+    request = TripPlanRequest.model_validate({
+        "origin": {"name": "Start", "lat": 12.0, "lng": 77.0},
+        "destination": {"name": "Finish", "lat": 12.01, "lng": 77.01},
+        "vehicle_type": vehicle,
+        "preference": "best",
+    })
+
+    routes = asyncio.run(trip_planner.fetch_road_routes(request))
+
+    assert routes
+    assert "exclude" not in seen
 
 
 def test_safest_preference_uses_active_hazard_exposure():

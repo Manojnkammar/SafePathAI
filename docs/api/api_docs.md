@@ -4,6 +4,7 @@ The mobile Trip Planner uses the following API endpoints:
 
 - `GET /api/v1/routes/places/search?q=<text>` returns geocoded place suggestions. A place is considered selected only after the user picks a suggestion with coordinates.
 - `POST /api/v1/routes/plan` requests a road route for an origin, destination, ordered `stops`, `vehicle_type` (`bike`, `car`, `ev`, or `bus`), and `preference` (`best`, `safest`, `fuel_saver`, or `less_traffic`).
+- `GET /api/v1/routes/nearby?lat=<latitude>&lng=<longitude>&category=<category>` returns nearby OpenStreetMap services within 5 km. Supported categories are `hospital`, `fuel`, `hotel`, `restaurant`, `medical`, `police`, and `atm`. The backend uses Overpass first and falls back to bounded Nominatim search when Overpass is unavailable.
 
 Route alternatives include the provider geometry, total distance and duration, ordered leg metrics, and an estimated safety score when active hazard data exists. The selected provider enforces its own waypoint limits; provider rejections are surfaced as routing errors. The existing `POST /api/v1/routes/safe` endpoint remains unchanged; it uses the application's synthetic grid network and is not the road route provider used by the Trip Planner.
 

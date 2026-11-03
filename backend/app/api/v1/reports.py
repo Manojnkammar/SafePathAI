@@ -64,6 +64,24 @@ async def submit_report(body: ReportCreate, session: AsyncSession = Depends(get_
     return report
 
 
+@router.delete("/{report_id}", status_code=204)
+async def delete_report(report_id: int, user_id: str, session: AsyncSession = Depends(get_session)):
+    report = await session.get(CommunityReport, report_id)
+    if not report:
+        raise HTTPException(404, "Report not found")
+    if not user_id or report.user_id != user_id:
+        raise HTTPException(403, "Only the user who created this report can delete it.")
+
+    if report.media_url:
+        media_path = Path(report.media_url.split("/media/", 1)[-1])
+        if len(media_path.parts) == 1:
+            file_path = Path("media") / media_path.name
+            if file_path.is_file():
+                file_path.unlink()
+    await session.delete(report)
+    await session.commit()
+
+
 @router.get("", response_model=list[ReportOut])
 async def list_reports(validated_only: bool = True, limit: int = 50, session: AsyncSession = Depends(get_session)):
     now = utcnow()

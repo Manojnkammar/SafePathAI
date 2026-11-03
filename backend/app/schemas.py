@@ -108,6 +108,7 @@ class ReportOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    user_id: str | None = None
     created_at: datetime
     incident_type: str
     severity: str
@@ -192,7 +193,7 @@ class TripPlace(LatLng):
 class TripPlanRequest(BaseModel):
     origin: TripPlace
     destination: TripPlace
-    stops: list[TripPlace] = Field(default_factory=list)
+    stops: list[TripPlace] = Field(default_factory=list, max_length=98)
     vehicle_type: TripVehicle
     preference: TripPreference
 

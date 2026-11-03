@@ -15,6 +15,7 @@ from app.services.geo import haversine_m
 
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+MAX_OSRM_COORDINATES = 100
 
 
 class TripProviderError(Exception):
@@ -53,12 +54,23 @@ async def search_places(query: str) -> list[PlaceSuggestion]:
 
 async def fetch_road_routes(request: TripPlanRequest) -> list[dict[str, Any]]:
     places = [request.origin, *request.stops, request.destination]
+    if len(places) > MAX_OSRM_COORDINATES:
+        raise TripProviderError(
+            f"This trip has {len(places)} locations, but the routing provider supports at most "
+            f"{MAX_OSRM_COORDINATES}. Remove some stops and try again."
+        )
     coordinates = ";".join(f"{place.lng},{place.lat}" for place in places)
+    route_params: dict[str, str] = {
+        "overview": "full",
+        "geometries": "geojson",
+        "steps": "false",
+        "alternatives": "true",
+    }
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.get(
                 f"{OSRM_URL}/{coordinates}",
-                params={"overview": "full", "geometries": "geojson", "steps": "false", "alternatives": "true"},
+                params=route_params,
             )
             response.raise_for_status()
             payload = response.json()
@@ -216,8 +228,14 @@ def build_trip_response(
         estimation_note = "Fuel and cost are unavailable because bus-specific consumption and fuel price are not configured."
     else:
         estimation_note = "Fuel and cost are unavailable because vehicle efficiency and fuel price are not configured."
+    vehicle_note = {
+        "bike": "Bike selected; this OSRM driving provider does not expose a bicycle profile.",
+        "car": "Car routing uses the OSRM driving profile.",
+        "ev": "EV selected; charging availability and EV-specific restrictions are not included.",
+        "bus": "Bus selected; bus-specific restrictions are not included by this provider.",
+    }[request.vehicle_type.value]
     return TripPlanResponse(
-        provider="OSRM (OpenStreetMap)",
+        provider=f"OSRM (OpenStreetMap) — {vehicle_note}",
         active_hazards=len(hazards),
         vehicle_type=request.vehicle_type,
         preference=request.preference,

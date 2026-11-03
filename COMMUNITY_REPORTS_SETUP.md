@@ -40,6 +40,20 @@ DATABASE_URL=sqlite+aiosqlite:///./safepath.db
 HAZARD_TTL_HOURS=6
 ```
 
+When testing on a physical Android device, start the API on all network
+interfaces so the phone can reach the computer:
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Set `EXPO_PUBLIC_API_URL` to the computer's LAN IPv4 address, for example
+`http://192.168.1.25:8000/api/v1`. The phone and computer must be on the
+same Wi-Fi network, and Windows Firewall must allow inbound TCP port 8000.
+After changing `app.json`, rebuild the Android development build; Expo Go
+cannot apply native manifest changes to an already-installed build.
+
 Production PostgreSQL example:
 
 ```text
@@ -67,3 +81,8 @@ The current implementation stores files under `backend/media/` and saves the pub
 4. Select a category, choose or capture an image, confirm GPS, submit, and confirm the returned report.
 5. Pull down to refresh and test upvote duplicate prevention.
 6. Verify resolved and expired reports disappear from active hazards.
+
+If place search reports a Nominatim DNS error, fix the backend connection
+first. Mobile place search uses the backend proxy before attempting the
+direct OpenStreetMap fallback, so an unreachable API causes both errors to
+appear together.

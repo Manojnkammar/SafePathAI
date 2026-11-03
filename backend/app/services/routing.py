@@ -12,7 +12,8 @@ from app.core.config import settings
 from app.schemas import HazardOut, LatLng, RouteOption
 from app.services.geo import haversine_m
 
-SPEED_MPS = 11.0
+# Used for ETA estimates when live road-speed data is unavailable.
+SPEED_MPS = 25 / 3.6
 SEVERITY_WEIGHT = {"low": 1.0, "medium": 2.0, "high": 4.0, "critical": 8.0}
 HAZARD_UNIT_COST = 600.0  # seconds-equivalent penalty at the centre of a weight-1 hazard
 
@@ -151,6 +152,22 @@ def _path_stats(grid: Grid, costs: EdgeCosts, path: list[Node]):
     return length, exposed_len, hit
 
 
+def _segment_stats(start: LatLng, end: LatLng, hazards: list[HazardOut]):
+    length = haversine_m(start.lat, start.lng, end.lat, end.lng)
+    midpoint = ((start.lat + end.lat) / 2, (start.lng + end.lng) / 2)
+    exposed = False
+    hit: set[str] = set()
+    for hazard in hazards:
+        distance = min(
+            haversine_m(point[0], point[1], hazard.lat, hazard.lng)
+            for point in ((start.lat, start.lng), midpoint, (end.lat, end.lng))
+        )
+        if distance < hazard.radius_m:
+            exposed = True
+            hit.add(hazard.id)
+    return length, length if exposed else 0.0, hit
+
+
 def _fmt(ids: set[str], hazards: list[HazardOut]) -> list[str]:
     by_id = {h.id: h for h in hazards}
     return sorted(f"{by_id[i].incident_type} ({by_id[i].severity}) [{i}]" for i in ids)
@@ -160,19 +177,25 @@ def compute_routes(origin: LatLng, dest: LatLng, hazards: list[HazardOut], k: in
     grid = Grid(origin, dest)
     costs = EdgeCosts(grid, hazards)
     src, dst = grid.snap(origin), grid.snap(dest)
-    if src == dst:
-        src_c = grid.coord(src)
-        pts = [LatLng(lat=src_c[0], lng=src_c[1])]
+    if origin == dest:
         opt = RouteOption(
-            rank=1, points=pts, distance_m=0.0, eta_s=0, safety_score=100,
+            rank=1, points=[origin], distance_m=0.0, eta_s=0, safety_score=100,
             hazards_avoided=[], hazards_on_route=[],
             explanation="Origin and destination are effectively the same location.",
         )
         return 0.0, 0, [], [opt]
 
+    src_coord = LatLng(lat=grid.coord(src)[0], lng=grid.coord(src)[1])
+    dst_coord = LatLng(lat=grid.coord(dst)[0], lng=grid.coord(dst)[1])
+    start_length, start_exposed, start_hits = _segment_stats(origin, src_coord, hazards)
+    end_length, end_exposed, end_hits = _segment_stats(dst_coord, dest, hazards)
+    endpoint_length = start_length + end_length
+
     # Baseline: fastest route ignoring hazards (what a normal nav app would give).
     base_path = dijkstra(grid, costs, src, dst, use_hazards=False)
     base_len, _, base_hit_ids = _path_stats(grid, costs, base_path)
+    base_len += endpoint_length
+    base_hit_ids |= start_hits | end_hits
     base_eta = int(base_len / SPEED_MPS)
 
     # Top-K alternatives: re-run Dijkstra, inflating edges used by earlier routes.
@@ -191,6 +214,9 @@ def compute_routes(origin: LatLng, dest: LatLng, hazards: list[HazardOut], k: in
     scored = []
     for p in paths:
         length, exposed_len, hit_ids = _path_stats(grid, costs, p)
+        length += endpoint_length
+        exposed_len += start_exposed + end_exposed
+        hit_ids |= start_hits | end_hits
         cost = sum(costs.weight(u, v) for u, v in zip(p, p[1:]))
         safety = int(round(100 * (1 - exposed_len / length))) if length else 100
         scored.append((cost, p, length, hit_ids, safety))
@@ -213,7 +239,11 @@ def compute_routes(origin: LatLng, dest: LatLng, hazards: list[HazardOut], k: in
         options.append(
             RouteOption(
                 rank=rank,
-                points=[LatLng(lat=grid.coord(n)[0], lng=grid.coord(n)[1]) for n in p],
+                points=[
+                    origin,
+                    *(LatLng(lat=grid.coord(n)[0], lng=grid.coord(n)[1]) for n in p),
+                    dest,
+                ],
                 distance_m=round(length, 1),
                 eta_s=eta,
                 safety_score=max(0, min(100, safety)),
