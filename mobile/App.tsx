@@ -21,6 +21,7 @@ import {
   Image,
   Linking,
   Modal,
+  PanResponder,
   Platform,
   PermissionsAndroid,
   Pressable,
@@ -514,6 +515,52 @@ function MapMockOld({ variant = 1, hazards = false }: { variant?: 1 | 2; hazards
 export default function App() {
   const [stack, setStack] = useState<Screen[]>(['splash']);
   const screen = stack[stack.length - 1];
+  const [sosPosition, setSosPosition] = useState<{ x: number; y: number } | null>(null);
+  const sosPositionRef = useRef<{ x: number; y: number } | null>(null);
+  const sosBoundsRef = useRef({ width: 430, height: 800 });
+  const sosDragStart = useRef({ x: 0, y: 0 });
+  const sosDragTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sosDragging = useRef(false);
+  const sosHoldActive = useRef(false);
+  const sosResponder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: () => true,
+    onPanResponderTerminationRequest: () => false,
+    onPanResponderGrant: () => {
+      sosHoldActive.current = false;
+      sosDragging.current = false;
+      sosDragTimer.current = setTimeout(() => {
+        sosHoldActive.current = true;
+      }, 350);
+    },
+    onPanResponderMove: (_, gesture) => {
+      if (!sosHoldActive.current) return;
+      if (!sosDragging.current) {
+        sosDragging.current = true;
+        sosDragStart.current = sosPositionRef.current ?? { x: 0, y: 0 };
+      }
+      const bounds = sosBoundsRef.current;
+      setSosPosition({
+        x: Math.max(0, Math.min(bounds.width - 58, sosDragStart.current.x + gesture.dx)),
+        y: Math.max(0, Math.min(bounds.height - 58, sosDragStart.current.y + gesture.dy)),
+      });
+      sosPositionRef.current = {
+        x: Math.max(0, Math.min(bounds.width - 58, sosDragStart.current.x + gesture.dx)),
+        y: Math.max(0, Math.min(bounds.height - 58, sosDragStart.current.y + gesture.dy)),
+      };
+    },
+    onPanResponderRelease: () => {
+      if (sosDragTimer.current) clearTimeout(sosDragTimer.current);
+      if (!sosHoldActive.current && !sosDragging.current) setStack((current) => [...current, 'sos']);
+      sosHoldActive.current = false;
+      sosDragging.current = false;
+    },
+    onPanResponderTerminate: () => {
+      if (sosDragTimer.current) clearTimeout(sosDragTimer.current);
+      sosHoldActive.current = false;
+      sosDragging.current = false;
+    },
+  }), []);
 
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(false);
@@ -523,6 +570,7 @@ export default function App() {
   const [vehicleEditorOpen, setVehicleEditorOpen] = useState(false);
   const [savedPlaces, setSavedPlaces] = useState<SavedPlace[]>([]);
   const [savedPlacesLoading, setSavedPlacesLoading] = useState(true);
+  const [savedPlacesPickerOpen, setSavedPlacesPickerOpen] = useState(false);
   const [profilePhotoUri, setProfilePhotoUri] = useState<string | null>(null);
   const [savedRoutes, setSavedRoutes] = useState<SavedRoute[]>([]);
   const [savedRoutesLoading, setSavedRoutesLoading] = useState(false);
@@ -551,6 +599,9 @@ export default function App() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [passwordConfirmation, setPasswordConfirmation] = useState('');
+  const [resetPassword, setResetPassword] = useState('');
+  const [resetPasswordConfirmation, setResetPasswordConfirmation] = useState('');
+  const [resetToken, setResetToken] = useState('');
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
   const [countryCode, setCountryCode] = useState('+91');
@@ -562,6 +613,8 @@ export default function App() {
   const [tripDestination, setTripDestination] = useState<TripPlace | null>(null);
   const [tripStops, setTripStops] = useState<TripStop[]>([]);
   const [vehicle, setVehicle] = useState<TripVehicle | null>(null);
+  const [navigationVehicle, setNavigationVehicle] = useState<TripVehicle>('car');
+  const [navigationVehiclePickerOpen, setNavigationVehiclePickerOpen] = useState(false);
   const [routePref, setRoutePref] = useState<TripPreference>('best');
   const [tripPlan, setTripPlan] = useState<TripPlan | null>(null);
   const [tripRouteIndex, setTripRouteIndex] = useState(0);
@@ -1064,6 +1117,19 @@ export default function App() {
     return () => clearTimeout(t);
   }, [screen]);
 
+  useEffect(() => {
+    const openResetLink = (url: string | null | undefined) => {
+      if (!url || !url.startsWith('safepath://reset-password')) return;
+      const token = url.match(/[?&]token=([^&]+)/)?.[1];
+      if (!token) return;
+      setResetToken(decodeURIComponent(token));
+      setStack(['reset-password']);
+    };
+    void Linking.getInitialURL().then(openResetLink);
+    const subscription = Linking.addEventListener('url', ({ url }) => openResetLink(url));
+    return () => subscription.remove();
+  }, []);
+
   /* API actions */
   async function login() {
     if (!email.trim() || !password) {
@@ -1085,6 +1151,60 @@ export default function App() {
     }
   }
 
+  async function requestPasswordReset() {
+    if (!email.trim()) {
+      Alert.alert('Email required', 'Enter the email address linked to your account.');
+      return;
+    }
+    setLoading(true);
+    try {
+      await api<{ message: string }>('/users/request-password-reset', {
+        method: 'POST',
+        body: { email: email.trim() },
+      });
+      Alert.alert('Check your email', 'If an account exists for that address, we sent a password reset link.');
+    } catch (error) {
+      Alert.alert('Unable to send reset link', error instanceof Error ? error.message : 'Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function completePasswordReset() {
+    if (!resetToken) {
+      Alert.alert('Invalid link', 'This password reset link is missing its token.');
+      return;
+    }
+    if (!resetPassword || resetPassword !== resetPasswordConfirmation) {
+      Alert.alert('Passwords do not match', 'Enter the same new password in both fields.');
+      return;
+    }
+    setLoading(true);
+    try {
+      const result = await api<{ message: string }>('/users/reset-password', {
+        method: 'POST',
+        body: {
+          token: resetToken,
+          password: resetPassword,
+          password_confirmation: resetPasswordConfirmation,
+        },
+      });
+      Alert.alert('Password updated', result.message, [{
+        text: 'Sign in',
+        onPress: () => {
+          setResetPassword('');
+          setResetPasswordConfirmation('');
+          setResetToken('');
+          setStack(['login']);
+        },
+      }]);
+    } catch (error) {
+      Alert.alert('Unable to reset password', error instanceof Error ? error.message : 'Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function shareCurrentRoute() {
     try {
       let locationToShare = sharedLocation;
@@ -1094,6 +1214,7 @@ export default function App() {
           Alert.alert('Location permission required', 'Allow location access to share your current location.');
           return;
         }
+
         const position = await withTimeout(
           Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
           15000,
@@ -1116,6 +1237,37 @@ export default function App() {
     } catch (error) {
       Alert.alert('Could not share location', error instanceof Error ? error.message : 'Please try again.');
     }
+  }
+
+  async function saveSearchedPlace() {
+    if (!sharedLocation) {
+      Alert.alert('Place unavailable', 'Search for a place first, then tap Save Place.');
+      return;
+    }
+
+    if (savedPlaces.some((place) => place.lat === sharedLocation.lat && place.lng === sharedLocation.lng)) {
+      Alert.alert('Already saved', `${sharedLocation.name} is already in your saved places.`);
+      return;
+    }
+
+    const updatedPlaces = [...savedPlaces, sharedLocation];
+    try {
+      await AsyncStorage.setItem(SAVED_PLACES_KEY, JSON.stringify(updatedPlaces));
+      setSavedPlaces(updatedPlaces);
+      Alert.alert('Place saved', `${sharedLocation.name} was added to your saved places.`);
+    } catch (error) {
+      Alert.alert('Could not save place', error instanceof Error ? error.message : 'Please try again.');
+    }
+  }
+
+  function selectNavigationVehicle() {
+    setNavigationVehiclePickerOpen(true);
+  }
+
+  function openSavedPlace(place: SavedPlace) {
+    setSharedLocation(place);
+    setSavedPlacesPickerOpen(false);
+    go('navigate');
   }
 
   async function signUp() {
@@ -1587,7 +1739,7 @@ export default function App() {
           <>
             <Field value={email} onChangeText={setEmail} placeholder="Email" icon="✉" keyboardType="email-address" />
             <Field value={password} onChangeText={setPassword} placeholder="Password" icon="🔒" secure />
-            <Text style={s.link}>Forgot Password?</Text>
+            <Text style={s.link} onPress={requestPasswordReset}>Forgot Password?</Text>
           </>
         )}
         <Btn
@@ -1617,6 +1769,7 @@ export default function App() {
                   setName('');
                   setPhone('');
                 }
+
                 setSignUpMode(enteringSignUp);
               }}
             >
@@ -1627,13 +1780,43 @@ export default function App() {
     );
   }
 
+  function renderResetPassword() {
+    return (
+      <View>
+        <View style={[s.center, { paddingTop: 30, paddingBottom: 14 }]}>
+          <Text style={[s.shield, { fontSize: 54 }]}>🛡️</Text>
+          <Text style={s.h1}>Reset Password</Text>
+          <Text style={s.white12}>Choose a new password for your account</Text>
+        </View>
+        <Field label="New password" value={resetPassword} onChangeText={setResetPassword} placeholder="New password" icon="🔒" secure maxLength={64} />
+        <Field label="Confirm password" value={resetPasswordConfirmation} onChangeText={setResetPasswordConfirmation} placeholder="Enter password again" icon="🔒" secure maxLength={64} />
+        <Btn title={loading ? 'Updating…' : 'Update Password'} onPress={completePasswordReset} disabled={loading} />
+        <Btn title="Back to Login" outline onPress={() => setStack(['login'])} />
+      </View>
+    );
+  }
+
   function renderHome() {
     return (
       <View style={{ paddingTop: 18 }}>
         <View style={s.rowBetween}>
-          <View>
+          <View style={s.greetingBlock}>
+            <Pressable
+              style={s.homeAvatar}
+              onPress={() => tab('profile')}
+              accessibilityRole="button"
+              accessibilityLabel="Open profile"
+            >
+              {profilePhotoUri ? (
+                <Image source={{ uri: profilePhotoUri }} style={s.homeAvatarImage} resizeMode="cover" />
+              ) : (
+                <Text style={s.homeAvatarText}>{initials}</Text>
+              )}
+            </Pressable>
+            <View>
             <Text style={s.greeting}>Hello, {displayName.split(' ')[0]} 😊</Text>
             <Text style={s.muted}>Drive Safe, Stay Safe</Text>
+            </View>
           </View>
           <Text style={{ fontSize: 20 }} onPress={() => tab('community')}>🔔</Text>
         </View>
@@ -1681,6 +1864,12 @@ export default function App() {
   }
 
   function renderNavigate(variant: 1 | 2) {
+    const navigationVehicleIcon: Record<TripVehicle, string> = {
+      bike: '🏍️',
+      car: '🚗',
+      ev: '🔌',
+      bus: '🚌',
+    };
     const distanceText = routeSummary
       ? routeSummary.distanceM >= 1000
         ? `${(routeSummary.distanceM / 1000).toFixed(1)} km`
@@ -1701,6 +1890,8 @@ export default function App() {
         <MapMock
           variant={variant}
           hazards={variant === 2}
+          initialCenter={sharedLocation ? { lat: sharedLocation.lat, lng: sharedLocation.lng } : undefined}
+          destination={sharedLocation ? { lat: sharedLocation.lat, lng: sharedLocation.lng } : null}
           nearbyPlaces={nearbyPlaces}
           onDestinationChange={(point, name) => setSharedLocation({
             ...point,
@@ -1722,7 +1913,12 @@ export default function App() {
         </View>
 
         <View style={s.actionRow}>
-          {[['🧭', 'Route Info', () => go('route')], ['🗺️', 'Maps', () => go(variant === 1 ? 'navigate2' : 'navigate')], ['⤴', 'Share', () => { void shareCurrentRoute(); }], ['⛔', 'Stop', back]].map(([i, l, fn]) => (
+          {[
+            ['🧭', 'Route Info', () => go('route')],
+            [navigationVehicleIcon[navigationVehicle], 'Vehicle', selectNavigationVehicle],
+            ['⤴', 'Share', () => { void shareCurrentRoute(); }],
+            ['🔖', 'Save Place', saveSearchedPlace],
+          ].map(([i, l, fn]) => (
             <Pressable key={l as string} style={s.actionBtn} onPress={fn as () => void}>
               <Text style={{ fontSize: 20 }}>{i as string}</Text>
               <Text style={s.mini}>{l as string}</Text>
@@ -2242,10 +2438,13 @@ export default function App() {
             icon="📍"
             title="Saved Places"
             value={savedPlacesLoading ? 'Loading…' : `${savedPlaces.length} Places`}
-            onPress={() => Alert.alert(
-              'Saved Places',
-              savedPlaces.length > 0 ? savedPlaces.map((place) => place.name).join('\n') : 'You have no saved places yet.',
-            )}
+            onPress={() => {
+              if (savedPlaces.length === 0) {
+                Alert.alert('Saved Places', 'You have no saved places yet.');
+                return;
+              }
+              setSavedPlacesPickerOpen(true);
+            }}
           />
           <Row
             icon="🕘"
@@ -2571,6 +2770,7 @@ export default function App() {
     switch (screen) {
       case 'splash': return renderSplash();
       case 'login': return renderLogin();
+      case 'reset-password': return renderResetPassword();
       case 'home': return renderHome();
       case 'navigate': return renderNavigate(1);
       case 'navigate2': return renderNavigate(2);
@@ -2588,7 +2788,7 @@ export default function App() {
     }
   }
 
-  const showHeader = !['splash', 'login', 'home', 'accident', 'navigate', 'navigate2'].includes(screen);
+  const showHeader = !['splash', 'login', 'reset-password', 'home', 'accident', 'navigate', 'navigate2'].includes(screen);
   const showTabs = TAB_SCREENS.includes(screen);
   const activeTab: Screen =
     screen === 'navigate2' ? 'navigate' : screen === 'route' ? 'trip' : TABS.some((t) => t.key === screen) ? screen : 'home';
@@ -2596,8 +2796,82 @@ export default function App() {
 
   return (
     <View style={[s.outer, isDanger && { backgroundColor: '#1D1426' }]}>
-    <SafeAreaView style={[s.safe, s.phone, isDanger && { backgroundColor: '#1D1426' }]}>
+    <SafeAreaView
+      style={[s.safe, s.phone, isDanger && { backgroundColor: '#1D1426' }]}
+      onLayout={(event) => {
+        const { width, height } = event.nativeEvent.layout;
+        const bounds = { width, height };
+        sosBoundsRef.current = bounds;
+        setSosPosition((current) => {
+          if (current) return current;
+          const initial = { x: width - 76, y: height - 142 };
+          sosPositionRef.current = initial;
+          return initial;
+        });
+      }}
+    >
       <StatusBar barStyle="light-content" />
+      <Modal
+        visible={savedPlacesPickerOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setSavedPlacesPickerOpen(false)}
+      >
+        <View style={s.vehicleModalBackdrop}>
+          <View style={s.vehicleModal}>
+            <Text style={s.h1}>Saved Places</Text>
+            <Text style={[s.muted, { marginTop: 6 }]}>Select a place to show it on the map.</Text>
+            {savedPlaces.map((place) => (
+              <Pressable
+                key={`${place.name}-${place.lat}-${place.lng}`}
+                style={s.savedPlaceOption}
+                onPress={() => openSavedPlace(place)}
+              >
+                <Text style={s.navigationVehicleIcon}>📍</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.rowTitle}>{place.name}</Text>
+                  <Text style={s.mini}>{place.lat.toFixed(5)}, {place.lng.toFixed(5)}</Text>
+                </View>
+                <Text style={s.arrow}>›</Text>
+              </Pressable>
+            ))}
+            <Btn title="Cancel" outline onPress={() => setSavedPlacesPickerOpen(false)} />
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        visible={navigationVehiclePickerOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setNavigationVehiclePickerOpen(false)}
+      >
+        <View style={s.vehicleModalBackdrop}>
+          <View style={s.vehicleModal}>
+            <Text style={s.h1}>Vehicle type</Text>
+            <Text style={[s.muted, { marginTop: 6 }]}>Select the vehicle for live navigation.</Text>
+            {([
+              ['bike', '🏍️', 'Bike'],
+              ['car', '🚗', 'Car'],
+              ['ev', '🔌', 'EV'],
+              ['bus', '🚌', 'Bus'],
+            ] as [TripVehicle, string, string][]).map(([value, icon, label]) => (
+              <Pressable
+                key={value}
+                style={[s.navigationVehicleOption, navigationVehicle === value && s.navigationVehicleOptionActive]}
+                onPress={() => {
+                  setNavigationVehicle(value);
+                  setNavigationVehiclePickerOpen(false);
+                }}
+              >
+                <Text style={s.navigationVehicleIcon}>{icon}</Text>
+                <Text style={s.rowTitle}>{label}</Text>
+                {navigationVehicle === value ? <Text style={s.navigationVehicleSelected}>✓</Text> : null}
+              </Pressable>
+            ))}
+            <Btn title="Cancel" outline onPress={() => setNavigationVehiclePickerOpen(false)} />
+          </View>
+        </View>
+      </Modal>
       <Modal
         visible={vehicleEditorOpen}
         transparent
@@ -2815,10 +3089,16 @@ export default function App() {
           {content()}
         </ScrollView>
       )}
-      {screen === 'offline' ? (
-        <Pressable onPress={() => go('sos')} style={s.offlineSosFab} accessibilityRole="button" accessibilityLabel="Emergency SOS">
-          <Text style={s.offlineSosText}>SOS</Text>
-        </Pressable>
+      {!['splash', 'login', 'reset-password', 'sos', 'accident'].includes(screen) ? (
+        <View
+          {...sosResponder.panHandlers}
+          style={[s.sosFab, sosPosition ? { left: sosPosition.x, top: sosPosition.y, right: undefined, bottom: undefined } : null]}
+          accessible
+          accessibilityRole="button"
+          accessibilityLabel="Emergency SOS. Tap to open, or press and hold to drag."
+        >
+          <Text style={s.sosFabText}>SOS</Text>
+        </View>
       ) : null}
       {showTabs ? (
         <View style={s.bottomNav}>
@@ -2848,6 +3128,10 @@ const s = StyleSheet.create({
   content: { padding: 18, paddingBottom: 30 },
   center: { alignItems: 'center', justifyContent: 'center' },
   rowBetween: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  greetingBlock: { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 10 },
+  homeAvatar: { width: 44, height: 44, borderRadius: 22, backgroundColor: C.blue, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: '#4B4F6D', overflow: 'hidden' },
+  homeAvatarImage: { width: '100%', height: '100%' },
+  homeAvatarText: { color: C.white, fontSize: 15, fontWeight: '700' },
 
   shield: { fontSize: 84 },
   brand: { color: C.white, fontSize: 34, fontWeight: '700', marginTop: 12 },
@@ -2952,6 +3236,11 @@ const s = StyleSheet.create({
   report: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.panel, borderRadius: 11, borderWidth: 1, borderColor: C.border, padding: 14, marginTop: 10 },
   vehicleModalBackdrop: { flex: 1, backgroundColor: 'rgba(4,7,20,0.82)', justifyContent: 'center', padding: 20 },
   vehicleModal: { backgroundColor: C.bg2, borderRadius: 12, borderWidth: 1, borderColor: C.border, padding: 16 },
+  navigationVehicleOption: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: C.panel, borderRadius: 9, borderWidth: 1, borderColor: C.border, padding: 12, marginTop: 10 },
+  navigationVehicleOptionActive: { borderColor: C.blueLight, backgroundColor: C.panel2 },
+  navigationVehicleIcon: { fontSize: 24, width: 34, textAlign: 'center' },
+  navigationVehicleSelected: { color: C.green, fontSize: 18, fontWeight: '700', marginLeft: 'auto' },
+  savedPlaceOption: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: C.panel, borderRadius: 9, borderWidth: 1, borderColor: C.border, padding: 12, marginTop: 10 },
   contactCard: { backgroundColor: C.panel, borderRadius: 10, borderWidth: 1, borderColor: C.border, padding: 12, marginTop: 8 },
   reportModalBackdrop: { position: 'absolute', left: -18, right: -18, top: -18, bottom: 0, backgroundColor: 'rgba(4,7,20,0.82)', justifyContent: 'center', padding: 18 },
   reportModal: { backgroundColor: C.bg2, borderRadius: 12, borderWidth: 1, borderColor: C.border, padding: 16, marginTop: 204 },
@@ -2965,8 +3254,8 @@ const s = StyleSheet.create({
   seg: { flex: 1, alignItems: 'center', paddingVertical: 8, borderRadius: 6 },
   skip: { backgroundColor: C.panel, borderRadius: 9, borderWidth: 1, borderColor: C.border, paddingHorizontal: 18, justifyContent: 'center' },
 
-  offlineSosFab: { position: 'absolute', right: 18, bottom: 66, width: 52, height: 52, borderRadius: 26, backgroundColor: C.red, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: '#FF8A8A', elevation: 5 },
-  offlineSosText: { color: C.white, fontSize: 13, fontWeight: '800' },
+  sosFab: { position: 'absolute', right: 18, bottom: 84, width: 58, height: 58, borderRadius: 29, backgroundColor: C.red, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: '#FF8A8A', elevation: 8, shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 5, shadowOffset: { width: 0, height: 3 } },
+  sosFabText: { color: C.white, fontSize: 14, fontWeight: '800' },
   bottomNav: { position: 'absolute', bottom: 0, left: 0, right: 0, height: 72, backgroundColor: C.bg2, borderTopWidth: 1, borderTopColor: '#282D49', flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center' },
   navItem: { alignItems: 'center', padding: 4 },
   navIconWrap: { width: 42, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },
@@ -2977,6 +3266,8 @@ const s = StyleSheet.create({
 function MapMock(props: {
   variant?: 1 | 2;
   hazards?: boolean;
+  initialCenter?: { lat: number; lng: number };
+  destination?: { lat: number; lng: number } | null;
   nearbyPlaces?: NearbyPlace[];
   onDestinationChange?: (point: { lat: number; lng: number }, name?: string) => void;
   onRouteSummary?: (summary: RouteSummary | null) => void;
@@ -2986,6 +3277,8 @@ function MapMock(props: {
       apiUrl={API_URL}
       style={{ height: 585 }}
       showRoutePanel
+      initialCenter={props.initialCenter}
+      destination={props.destination}
       nearbyPlaces={props.nearbyPlaces}
       onDestinationChange={props.onDestinationChange}
       onRouteSummary={props.onRouteSummary}

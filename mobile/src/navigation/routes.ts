@@ -1,6 +1,7 @@
 export const APP_ROUTES = {
   Splash: 'splash',
   Login: 'login',
+  ResetPassword: 'reset-password',
   Home: 'home',
   Navigate: 'navigate',
   Navigate2: 'navigate2',

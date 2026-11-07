@@ -70,6 +70,27 @@ class UserLogin(BaseModel):
     password: str
 
 
+class PasswordResetRequest(BaseModel):
+    email: str = Field(min_length=1, max_length=255)
+
+
+class PasswordResetComplete(BaseModel):
+    token: str = Field(min_length=32, max_length=128)
+    password: str
+    password_confirmation: str
+
+    @field_validator("password")
+    @classmethod
+    def password_meets_requirements(cls, password: str) -> str:
+        return validate_password_strength(password)
+
+    @model_validator(mode="after")
+    def password_confirmation_matches(self):
+        if self.password != self.password_confirmation:
+            raise ValueError("Password confirmation does not match.")
+        return self
+
+
 class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

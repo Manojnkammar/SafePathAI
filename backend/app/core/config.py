@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     route_gamma: float = 1.0
 
     hazard_ttl_hours: int = 6
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    password_reset_url: str = "safepath://reset-password"
 
     @property
     def cors_origin_list(self) -> list[str]:

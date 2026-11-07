@@ -38,6 +38,12 @@ Backend development:
 ```text
 DATABASE_URL=sqlite+aiosqlite:///./safepath.db
 HAZARD_TTL_HOURS=6
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=your-smtp-user
+SMTP_PASSWORD=your-smtp-password
+SMTP_FROM=SafePath AI <no-reply@example.com>
+PASSWORD_RESET_URL=safepath://reset-password
 ```
 
 When testing on a physical Android device, start the API on all network
@@ -53,6 +59,14 @@ Set `EXPO_PUBLIC_API_URL` to the computer's LAN IPv4 address, for example
 same Wi-Fi network, and Windows Firewall must allow inbound TCP port 8000.
 After changing `app.json`, rebuild the Android development build; Expo Go
 cannot apply native manifest changes to an already-installed build.
+
+Password recovery requires the SMTP settings above. The reset email contains a
+one-time link that expires after 30 minutes. After configuring SMTP, run the
+latest database migration before starting the backend:
+
+```powershell
+.\.venv\Scripts\alembic.exe upgrade head
+```
 
 Production PostgreSQL example:
 
