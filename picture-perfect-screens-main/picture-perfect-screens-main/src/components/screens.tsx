@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   ArrowLeft, Bell, Search, Mail, Lock, Eye, Phone, Navigation, Map, Settings2, Wifi, Home, Car,
   User, CornerUpLeft, CornerUpRight, Volume2, VolumeX, Minus, Share2, CircleSlash, Route, Layers,
@@ -468,13 +468,97 @@ export function EmergencyDetailsScreen() {
   );
 }
 
+/* ---------- 5 Expanding Label ---------- */
+export function ExpandingLabelScreen() {
+  const [active, setActive] = useState(0);
+  const [paused, setPaused] = useState(false);
+  const icons = [Home, Map, ClipboardList, Bell, User];
+  const labels = ["Home", "Map", "Trips", "Alerts", "Profile"];
+
+  useEffect(() => {
+    if (paused || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+
+    const interval = window.setInterval(() => {
+      setActive((current) => (current + 1) % labels.length);
+    }, 1400);
+
+    return () => window.clearInterval(interval);
+  }, [paused, labels.length]);
+
+  return (
+    <div className="phone">
+      <div className="flex items-center justify-between px-3 pt-4">
+        <div>
+          <div className="text-[13px] font-medium">SafePath AI</div>
+          <div className="text-[8px] text-muted-foreground">Your safety, our priority</div>
+        </div>
+        <Bell className="h-4 w-4 text-muted-foreground" />
+      </div>
+      <div className="flex-1 px-3 pt-8">
+        <div className="text-[18px] font-medium">Good morning, Rohan</div>
+        <div className="mt-1 text-[9px] text-muted-foreground">Where would you like to go?</div>
+        <div className="mt-4 flex h-10 items-center gap-2 rounded-lg border border-border bg-surface px-3 text-[9px] text-muted-foreground">
+          <Search className="h-3.5 w-3.5" />
+          Search destination
+        </div>
+        <Card className="mt-3 p-3">
+          <div className="text-[9px] text-muted-foreground">RECENT TRIP</div>
+          <div className="mt-1 flex items-center justify-between text-[10px]">
+            Bengaluru <span className="text-primary">→</span> Mysuru
+          </div>
+          <div className="mt-1 text-[8px] text-muted-foreground">120 km · 2h 45m</div>
+        </Card>
+      </div>
+      <nav
+        aria-label="Main navigation"
+        className="mx-2 mb-2 mt-auto flex h-14 shrink-0 items-center gap-1 rounded-full border border-border bg-surface px-2 shadow-lg"
+        onPointerEnter={() => setPaused(true)}
+        onPointerLeave={() => setPaused(false)}
+        onFocusCapture={() => setPaused(true)}
+        onBlurCapture={() => setPaused(false)}
+      >
+        {icons.map((Icon, i) => {
+          const isActive = i === active;
+
+          return (
+            <button
+              key={labels[i]}
+              type="button"
+              aria-label={labels[i]}
+              aria-current={isActive ? "page" : undefined}
+              onClick={() => setActive(i)}
+              className={`flex h-10 min-w-0 items-center justify-center overflow-hidden rounded-full transition-[background-color,color,flex-grow] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none ${
+                isActive ? "bg-gradient-primary text-primary-foreground" : "text-muted-foreground"
+              }`}
+              style={{ flexGrow: isActive ? 1.8 : 0.8 }}
+            >
+              <Icon aria-hidden="true" className="h-4 w-4 shrink-0" />
+              <span
+                className="overflow-hidden whitespace-nowrap text-[9px] transition-[max-width,opacity,transform] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none"
+                style={{
+                  maxWidth: isActive ? 52 : 0,
+                  marginLeft: isActive ? 6 : 0,
+                  opacity: isActive ? 1 : 0,
+                  transform: isActive ? "translateX(0)" : "translateX(-6px)",
+                }}
+              >
+                {labels[i]}
+              </span>
+            </button>
+          );
+        })}
+      </nav>
+    </div>
+  );
+}
+
 export const SCREENS = [
   ["Loading Screen", LoadingScreen], ["Login/Welcome Back Screen", LoginScreen], ["Home Dashboard", HomeScreen],
   ["Navigation GPS Map 1", Nav1Screen], ["Navigation GPS Map 2", Nav2Screen], ["Trip Planner", TripPlannerScreen],
   ["Emergency SOS", SosScreen], ["Communication Screen", CommunicationScreen], ["Nearby Services", NearbyScreen],
   ["Offline Maps", OfflineMapsScreen], ["Route Details", RouteDetailsScreen], ["Profile Screen", ProfileScreen],
   ["Accident Detected Screen", AccidentScreen], ["Community Reports", CommunityScreen], ["Settings Screen", SettingsScreen],
-  ["Emergency User Details", EmergencyDetailsScreen],
+  ["Emergency User Details", EmergencyDetailsScreen], ["5 Expanding Label", ExpandingLabelScreen],
 ] as const;
 // unused icon guards
 void [ShieldAlert, Send, Users];

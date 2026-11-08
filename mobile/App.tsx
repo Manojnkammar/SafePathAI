@@ -3,6 +3,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Battery from 'expo-battery';
 import Constants from 'expo-constants';
 import { File } from 'expo-file-system';
+import { ArrowLeft, Bell, ClipboardList, Crosshair, House, Share2, Trash2, UserRound, X } from 'lucide-react-native';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
@@ -18,6 +19,8 @@ import {
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  Easing,
   Image,
   Linking,
   Modal,
@@ -83,6 +86,8 @@ type TripVehicle = 'bike' | 'car' | 'ev' | 'bus';
 type TripPreference = 'best' | 'safest' | 'fuel_saver' | 'less_traffic';
 type TripPlace = { name: string; lat: number; lng: number };
 type TripStop = { id: number; place: TripPlace | null };
+type PendingTripStopUndo = { stop: TripStop; index: number };
+type PendingEmergencyContactUndo = { contact: EmergencyContact; index: number };
 type TripLeg = { origin_name: string; destination_name: string; distance_m: number; duration_s: number };
 type TripRoute = {
   rank: number;
@@ -225,13 +230,13 @@ function formatTripDuration(durationS: number) {
   return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes} min`;
 }
 
-const TABS: { key: Screen; label: string; icon: string }[] = [
-  { key: 'home', label: 'Home', icon: '⌂' },
-  { key: 'navigate', label: 'Map', icon: '⌖' },
-  { key: 'trip', label: 'Trips', icon: '▣' },
-  { key: 'community', label: 'Alerts', icon: '🔔' },
-  { key: 'profile', label: 'Profile', icon: '◉' },
-];
+const TABS = [
+  { key: 'home', label: 'Home', icon: House },
+  { key: 'navigate', label: 'Map', icon: Crosshair },
+  { key: 'trip', label: 'Trips', icon: ClipboardList },
+  { key: 'community', label: 'Alerts', icon: Bell },
+  { key: 'profile', label: 'Profile', icon: UserRound },
+] satisfies { key: Screen; label: string; icon: React.ComponentType<{ color?: string; size?: number; strokeWidth?: number }> }[];
 const TAB_SCREENS: Screen[] = ['home', 'navigate', 'navigate2', 'trip', 'route', 'community', 'profile', 'settings', 'nearby', 'offline', 'comm', 'emergency', 'sos'];
 const TITLES: Partial<Record<Screen, string>> = {
   trip: 'Trip Planner', sos: 'Emergency SOS', comm: 'Communication', nearby: 'Nearby Services',
@@ -240,6 +245,369 @@ const TITLES: Partial<Record<Screen, string>> = {
 };
 
 /* ───────────────────────── Small components ───────────────────────── */
+function SwipeableTripStop({
+  index,
+  enabled,
+  onMove,
+  onDelete,
+  restored,
+  rowType = 'stop',
+  children,
+}: {
+  index: number;
+  enabled: boolean;
+  onMove: (from: number, to: number) => void;
+  onDelete: (index: number) => void;
+  restored: boolean;
+  rowType?: 'stop' | 'contact';
+  children: React.ReactNode;
+}) {
+  const translationX = useRef(new Animated.Value(restored ? -48 : 0)).current;
+  const translationY = useRef(new Animated.Value(0)).current;
+  const touchStartedAt = useRef(0);
+  const rowHeight = useRef(100);
+  const [dragging, setDragging] = useState(false);
+  const [swiping, setSwiping] = useState(false);
+
+  useEffect(() => {
+    if (restored) {
+      Animated.spring(translationX, { toValue: 0, useNativeDriver: true, speed: 20, bounciness: 5 }).start();
+    }
+  }, [restored, translationX]);
+
+  const responder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => false,
+    onMoveShouldSetPanResponderCapture: (_, gesture) => {
+      const horizontalSwipe = gesture.dx < -20 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.2;
+      const heldReorder = enabled && Date.now() - touchStartedAt.current >= 350 && Math.abs(gesture.dy) > 8;
+      return horizontalSwipe || heldReorder;
+    },
+    onMoveShouldSetPanResponder: (_, gesture) => {
+      const horizontalSwipe = gesture.dx < -20 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.2;
+      const heldReorder = enabled && Date.now() - touchStartedAt.current >= 350 && Math.abs(gesture.dy) > 8;
+      return horizontalSwipe || heldReorder;
+    },
+    onPanResponderGrant: () => setDragging(true),
+    onPanResponderMove: (_, gesture) => {
+      if (Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.2) {
+        const swipeX = Math.min(0, gesture.dx);
+        translationX.setValue(swipeX);
+        setSwiping(swipeX < -12);
+      } else if (enabled && Date.now() - touchStartedAt.current >= 350) {
+        setSwiping(false);
+        translationY.setValue(gesture.dy);
+      }
+    },
+    onPanResponderRelease: (_, gesture) => {
+      if (gesture.dx <= -70 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.2) {
+        Animated.timing(translationX, { toValue: -320, duration: 180, useNativeDriver: true }).start(() => onDelete(index));
+        return;
+      }
+      setSwiping(false);
+      if (enabled && Date.now() - touchStartedAt.current >= 350 && Math.abs(gesture.dy) > 8) {
+        const offset = Math.round(gesture.dy / Math.max(rowHeight.current, 80));
+        if (offset !== 0) onMove(index, index + offset);
+      }
+      setDragging(false);
+      Animated.parallel([
+        Animated.spring(translationX, { toValue: 0, useNativeDriver: true, speed: 24, bounciness: 4 }),
+        Animated.spring(translationY, { toValue: 0, useNativeDriver: true, speed: 24, bounciness: 4 }),
+      ]).start();
+    },
+    onPanResponderTerminate: () => {
+      setDragging(false);
+      setSwiping(false);
+      Animated.parallel([
+        Animated.spring(translationX, { toValue: 0, useNativeDriver: true, speed: 24, bounciness: 4 }),
+        Animated.spring(translationY, { toValue: 0, useNativeDriver: true, speed: 24, bounciness: 4 }),
+      ]).start();
+    },
+    onPanResponderTerminationRequest: () => false,
+  }), [enabled, index, onDelete, onMove, translationX, translationY]);
+
+  return (
+    <View style={s.tripSwipeWrap}>
+      <View pointerEvents="none" style={[
+        s.tripSwipeDeleteUnderlay,
+        rowType === 'contact' && s.contactSwipeDeleteUnderlay,
+        !swiping && s.tripSwipeDeleteHidden,
+      ]}>
+        <Trash2 color={C.white} size={19} />
+        <Text style={s.tripSwipeDeleteText}>Delete</Text>
+      </View>
+      <Animated.View
+        {...responder.panHandlers}
+        onTouchStart={() => { touchStartedAt.current = Date.now(); }}
+        onLayout={(event) => { rowHeight.current = event.nativeEvent.layout.height; }}
+        style={[
+          rowType === 'contact' ? s.contactCard : s.tripStop,
+          dragging && s.tripStopDragging,
+          { transform: [{ translateX: translationX }, { translateY: translationY }] },
+        ]}
+      >
+        {children}
+      </Animated.View>
+    </View>
+  );
+}
+
+function TripStopUndoStrip({ message, onUndo }: { message: string; onUndo: () => void }) {
+  return (
+    <View style={s.tripUndoStrip}>
+      <Text style={s.tripUndoText}>{message}</Text>
+      <Pressable onPress={onUndo} accessibilityRole="button" accessibilityLabel={`Undo ${message.toLowerCase()}`} hitSlop={8}>
+        <Text style={s.tripUndoAction}>Undo</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+function NavigationBottomSheet({
+  durationText,
+  distanceText,
+  arrivalText,
+  vehicleLabel,
+  onHome,
+  onExit,
+  onRouteInfo,
+  onVehicle,
+  onShare,
+  onSavePlace,
+}: {
+  durationText: string;
+  distanceText: string;
+  arrivalText: string;
+  vehicleLabel: string;
+  onHome: () => void;
+  onExit: () => void;
+  onRouteInfo: () => void;
+  onVehicle: () => void;
+  onShare: () => void;
+  onSavePlace: () => void;
+}) {
+  const [viewportHeight, setViewportHeight] = useState(0);
+  const [expanded, setExpanded] = useState(false);
+  const translateY = useRef(new Animated.Value(0)).current;
+  const dragStart = useRef(0);
+  const currentY = useRef(0);
+  const sheetHeight = viewportHeight > 0
+    ? Math.min(240, Math.max(188, viewportHeight * 0.34))
+    : 240;
+  const peekHeight = Math.min(78, sheetHeight);
+  const collapsedOffset = sheetHeight - peekHeight;
+
+  const animateTo = useCallback((shouldExpand: boolean) => {
+    const target = shouldExpand ? 0 : collapsedOffset;
+    currentY.current = target;
+    setExpanded(shouldExpand);
+    Animated.spring(translateY, {
+      toValue: target,
+      useNativeDriver: true,
+      speed: 20,
+      bounciness: 2,
+    }).start();
+  }, [collapsedOffset, translateY]);
+
+  const responder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => false,
+    onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > 4,
+    onPanResponderGrant: () => {
+      dragStart.current = currentY.current;
+    },
+    onPanResponderMove: (_, gesture) => {
+      const nextY = Math.max(0, Math.min(collapsedOffset, dragStart.current + gesture.dy));
+      currentY.current = nextY;
+      translateY.setValue(nextY);
+    },
+    onPanResponderRelease: (_, gesture) => {
+      const shouldExpand = gesture.vy < -0.35 || currentY.current < collapsedOffset / 2;
+      animateTo(shouldExpand);
+    },
+    onPanResponderTerminate: () => animateTo(currentY.current < collapsedOffset / 2),
+  }), [animateTo, collapsedOffset, translateY]);
+
+  useEffect(() => {
+    const target = expanded ? 0 : collapsedOffset;
+    currentY.current = target;
+    translateY.setValue(target);
+  }, [collapsedOffset, expanded, translateY]);
+
+  const actions = [
+    { icon: '🧭', label: 'Route Info', onPress: onRouteInfo },
+    { icon: vehicleLabel, label: 'Vehicle', onPress: onVehicle },
+    { icon: '↗', label: 'Share', onPress: onShare },
+    { icon: '🔖', label: 'Save Place', onPress: onSavePlace },
+  ];
+
+  return (
+    <View
+      pointerEvents="box-none"
+      style={[StyleSheet.absoluteFill, { overflow: 'hidden' }]}
+      onLayout={(event) => setViewportHeight(event.nativeEvent.layout.height)}
+    >
+      <Animated.View
+        style={[
+          s.navigationSheet,
+          { height: sheetHeight, transform: [{ translateY }] },
+        ]}
+      >
+        <View {...responder.panHandlers} style={[s.navigationSheetDragArea, !expanded && s.navigationSheetPeekDragArea]}>
+          <View style={s.navigationSheetGrabber} />
+        </View>
+        <View {...responder.panHandlers} style={s.navigationPeekContent}>
+          <View style={s.navigationPeekInfoRow}>
+            <Pressable
+              onPress={onHome}
+              style={s.navigationPeekHome}
+              accessibilityRole="button"
+              accessibilityLabel="Go to Home"
+            >
+              <House color={C.white} size={27} strokeWidth={2} />
+            </Pressable>
+            <View style={s.navigationPeekMetrics}>
+              <View style={s.navigationPeekSummary}>
+                <Text style={s.navigationPeekDuration} numberOfLines={1}>{durationText}</Text>
+                <Text style={s.navigationPeekSubtitle} numberOfLines={1}>{distanceText}</Text>
+              </View>
+              <View style={s.navigationPeekDivider} />
+              <View style={s.navigationPeekSummary}>
+                <Text style={s.navigationPeekArrival} numberOfLines={1}>{arrivalText}</Text>
+                <Text style={s.navigationPeekSubtitle}>Arrival</Text>
+              </View>
+            </View>
+            <Pressable
+              onPress={onExit}
+              style={s.navigationPeekExit}
+              accessibilityRole="button"
+              accessibilityLabel="Exit navigation"
+            >
+              <View style={s.navigationPeekExitContent}>
+                <X color={C.white} size={18} strokeWidth={2} />
+                <Text style={s.navigationPeekExitText}>Exit</Text>
+              </View>
+            </Pressable>
+          </View>
+          {expanded ? (
+            <View style={s.navigationPeekActions}>
+              {actions.map((action) => (
+                <Pressable
+                  key={action.label}
+                  onPress={action.onPress}
+                  style={s.navigationPeekAction}
+                  accessibilityRole="button"
+                  accessibilityLabel={action.label}
+                >
+                  {action.label === 'Share' ? (
+                    <Share2 color={C.blueLight} size={19} strokeWidth={2.2} />
+                  ) : (
+                    <Text style={s.navigationPeekActionIcon}>{action.icon}</Text>
+                  )}
+                  <Text style={s.navigationPeekActionLabel} numberOfLines={1}>{action.label}</Text>
+                </Pressable>
+              ))}
+            </View>
+          ) : null}
+        </View>
+      </Animated.View>
+    </View>
+  );
+}
+
+function SlideToConfirm({ disabled, onConfirm }: { disabled: boolean; onConfirm: () => Promise<void> }) {
+  const thumbSize = 56;
+  const trackBorderWidth = 1;
+  const translateX = useRef(new Animated.Value(0)).current;
+  const trackWidth = useRef(0);
+  const dragStart = useRef(0);
+  const position = useRef(0);
+  const confirmedRef = useRef(false);
+  const onConfirmRef = useRef(onConfirm);
+  const disabledRef = useRef(disabled);
+  const [layoutWidth, setLayoutWidth] = useState(0);
+  const [confirmed, setConfirmed] = useState(false);
+  onConfirmRef.current = onConfirm;
+  disabledRef.current = disabled;
+
+  const responder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => false,
+    onMoveShouldSetPanResponder: (_, gesture) => (
+      !disabledRef.current
+      && !confirmedRef.current
+      && gesture.dx > 2
+      && Math.abs(gesture.dx) > Math.abs(gesture.dy)
+    ),
+    onPanResponderGrant: () => {
+      dragStart.current = position.current;
+    },
+    onPanResponderMove: (_, gesture) => {
+      const maxPosition = Math.max(0, trackWidth.current - trackBorderWidth * 2 - thumbSize);
+      position.current = Math.max(0, Math.min(maxPosition, dragStart.current + gesture.dx));
+      translateX.setValue(position.current);
+    },
+    onPanResponderRelease: () => {
+      const maxPosition = Math.max(0, trackWidth.current - trackBorderWidth * 2 - thumbSize);
+      if (maxPosition > 0 && position.current >= maxPosition * 0.9) {
+        position.current = maxPosition;
+        translateX.setValue(maxPosition);
+        confirmedRef.current = true;
+        setConfirmed(true);
+        void onConfirmRef.current().finally(() => {
+          confirmedRef.current = false;
+          setConfirmed(false);
+          position.current = 0;
+          Animated.spring(translateX, { toValue: 0, useNativeDriver: false, speed: 22, bounciness: 3 }).start();
+        });
+        return;
+      }
+      position.current = 0;
+      Animated.spring(translateX, { toValue: 0, useNativeDriver: false, speed: 22, bounciness: 3 }).start();
+    },
+    onPanResponderTerminate: () => {
+      position.current = 0;
+      Animated.spring(translateX, { toValue: 0, useNativeDriver: false, speed: 22, bounciness: 3 }).start();
+    },
+  }), [thumbSize, trackBorderWidth, translateX]);
+
+  const maxPosition = Math.max(1, layoutWidth - trackBorderWidth * 2 - thumbSize);
+  const fillWidth = translateX.interpolate({
+    inputRange: [0, maxPosition],
+    outputRange: [thumbSize, Math.max(layoutWidth - trackBorderWidth * 2, thumbSize)],
+    extrapolate: 'clamp',
+  });
+
+  return (
+    <View style={s.sosSlideSection}>
+      <View
+        style={[s.sosSlideTrack, disabled && { opacity: 0.55 }]}
+        onLayout={(event) => {
+          trackWidth.current = event.nativeEvent.layout.width;
+          setLayoutWidth(event.nativeEvent.layout.width);
+        }}
+      >
+        <Animated.View style={[s.sosSlideFill, { width: fillWidth }]} />
+        <Text pointerEvents="none" style={s.sosSlideLabel}>
+          {disabled ? 'Sending…' : confirmed ? 'Confirmed' : 'Activate Emergency SOS'}
+        </Text>
+        <Animated.View
+          {...responder.panHandlers}
+          accessible
+          accessibilityRole="adjustable"
+          accessibilityLabel="Slide to confirm emergency SOS"
+          accessibilityHint="Drag the knob to the end to send an emergency SOS"
+          accessibilityState={{ disabled, checked: confirmed }}
+          style={[
+            s.sosSlideThumb,
+            confirmed && s.sosSlideThumbConfirmed,
+            { transform: [{ translateX }] },
+          ]}
+        >
+          <Text style={s.sosSlideThumbText}>{confirmed ? '✓' : '›'}</Text>
+        </Animated.View>
+      </View>
+    </View>
+  );
+}
+
 function Btn({ title, onPress, outline, danger, pill, disabled, small }: {
   title: string; onPress: () => void; outline?: boolean; danger?: boolean; pill?: boolean; disabled?: boolean; small?: boolean;
 }) {
@@ -377,10 +745,11 @@ function Section({ children }: { children: React.ReactNode }) {
   return <Text style={s.section}>{children}</Text>;
 }
 
-function TripPlaceField({ label, value, onChange }: {
+function TripPlaceField({ label, value, onChange, accessory }: {
   label: string;
   value: TripPlace | null;
   onChange: (place: TripPlace | null) => void;
+  accessory?: React.ReactNode;
 }) {
   const [query, setQuery] = useState(value?.name ?? '');
   const [suggestions, setSuggestions] = useState<TripPlace[]>([]);
@@ -409,24 +778,29 @@ function TripPlaceField({ label, value, onChange }: {
   return (
     <View style={{ marginTop: 12 }}>
       <Text style={s.label}>{label}</Text>
-      <View style={s.inputWrap}>
-        <TextInput
-          value={query}
-          onChangeText={(text) => {
-            setQuery(text);
-            setSuggestions([]);
-            setError('');
-            onChange(null);
-          }}
-          placeholder="Search a place"
-          placeholderTextColor={C.muted}
-          style={s.input}
-          returnKeyType="search"
-          onSubmitEditing={searchPlaces}
-        />
-        <Pressable onPress={searchPlaces} disabled={loading} accessibilityRole="button">
-          {loading ? <ActivityIndicator color={C.blueLight} /> : <Text style={{ color: C.blueLight, fontWeight: '700' }}>Search</Text>}
-        </Pressable>
+      <View style={accessory ? s.tripPlaceFieldRow : undefined}>
+        <View style={accessory ? s.tripPlaceFieldMain : undefined}>
+          <View style={s.inputWrap}>
+            <TextInput
+              value={query}
+              onChangeText={(text) => {
+                setQuery(text);
+                setSuggestions([]);
+                setError('');
+                onChange(null);
+              }}
+              placeholder="Search a place"
+              placeholderTextColor={C.muted}
+              style={s.input}
+              returnKeyType="search"
+              onSubmitEditing={searchPlaces}
+            />
+            <Pressable onPress={searchPlaces} disabled={loading} accessibilityRole="button">
+              {loading ? <ActivityIndicator color={C.blueLight} /> : <Text style={{ color: C.blueLight, fontWeight: '700' }}>Search</Text>}
+            </Pressable>
+          </View>
+        </View>
+        {accessory}
       </View>
       {value ? <Text style={s.mini}>Selected: {value.name}</Text> : null}
       {suggestions.map((place, index) => (
@@ -515,8 +889,10 @@ function MapMockOld({ variant = 1, hazards = false }: { variant?: 1 | 2; hazards
 export default function App() {
   const [stack, setStack] = useState<Screen[]>(['splash']);
   const screen = stack[stack.length - 1];
-  const [sosPosition, setSosPosition] = useState<{ x: number; y: number } | null>(null);
+  const navAnimations = useRef(TABS.map((_, index) => new Animated.Value(index === 0 ? 1 : 0))).current;
+  const [sosPositionReady, setSosPositionReady] = useState(false);
   const sosPositionRef = useRef<{ x: number; y: number } | null>(null);
+  const sosAnimatedPosition = useRef(new Animated.ValueXY()).current;
   const sosBoundsRef = useRef({ width: 430, height: 800 });
   const sosDragStart = useRef({ x: 0, y: 0 });
   const sosDragTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -531,7 +907,7 @@ export default function App() {
       sosDragging.current = false;
       sosDragTimer.current = setTimeout(() => {
         sosHoldActive.current = true;
-      }, 350);
+      }, 180);
     },
     onPanResponderMove: (_, gesture) => {
       if (!sosHoldActive.current) return;
@@ -540,18 +916,18 @@ export default function App() {
         sosDragStart.current = sosPositionRef.current ?? { x: 0, y: 0 };
       }
       const bounds = sosBoundsRef.current;
-      setSosPosition({
-        x: Math.max(0, Math.min(bounds.width - 58, sosDragStart.current.x + gesture.dx)),
-        y: Math.max(0, Math.min(bounds.height - 58, sosDragStart.current.y + gesture.dy)),
-      });
-      sosPositionRef.current = {
+      const position = {
         x: Math.max(0, Math.min(bounds.width - 58, sosDragStart.current.x + gesture.dx)),
         y: Math.max(0, Math.min(bounds.height - 58, sosDragStart.current.y + gesture.dy)),
       };
+      sosPositionRef.current = position;
+      sosAnimatedPosition.setValue(position);
     },
     onPanResponderRelease: () => {
       if (sosDragTimer.current) clearTimeout(sosDragTimer.current);
-      if (!sosHoldActive.current && !sosDragging.current) setStack((current) => [...current, 'sos']);
+      if (!sosDragging.current && !sosHoldActive.current) {
+        setStack((current) => [...current, 'sos']);
+      }
       sosHoldActive.current = false;
       sosDragging.current = false;
     },
@@ -560,7 +936,7 @@ export default function App() {
       sosHoldActive.current = false;
       sosDragging.current = false;
     },
-  }), []);
+  }), [sosAnimatedPosition]);
 
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(false);
@@ -612,6 +988,12 @@ export default function App() {
   const [tripOrigin, setTripOrigin] = useState<TripPlace | null>(null);
   const [tripDestination, setTripDestination] = useState<TripPlace | null>(null);
   const [tripStops, setTripStops] = useState<TripStop[]>([]);
+  const [pendingTripStopUndo, setPendingTripStopUndo] = useState<PendingTripStopUndo | null>(null);
+  const [restoredTripStopId, setRestoredTripStopId] = useState<number | null>(null);
+  const pendingTripStopUndoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [pendingEmergencyContactUndo, setPendingEmergencyContactUndo] = useState<PendingEmergencyContactUndo | null>(null);
+  const [restoredEmergencyContactId, setRestoredEmergencyContactId] = useState<string | null>(null);
+  const pendingEmergencyContactUndoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [vehicle, setVehicle] = useState<TripVehicle | null>(null);
   const [navigationVehicle, setNavigationVehicle] = useState<TripVehicle>('car');
   const [navigationVehiclePickerOpen, setNavigationVehiclePickerOpen] = useState(false);
@@ -645,6 +1027,7 @@ export default function App() {
   const [dl, setDl] = useState(45);
   const [routeSummary, setRouteSummary] = useState<RouteSummary | null>(null);
   const [sharedLocation, setSharedLocation] = useState<{ lat: number; lng: number; name: string } | null>(null);
+  const [navigationMapSession, setNavigationMapSession] = useState(0);
   const [sosLocation, setSosLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [nearbyPlaces, setNearbyPlaces] = useState<NearbyPlace[]>([]);
   const [nearbyLoading, setNearbyLoading] = useState(false);
@@ -795,6 +1178,52 @@ export default function App() {
   const go = useCallback((next: Screen) => setStack((st) => [...st, next]), []);
   const back = useCallback(() => setStack((st) => (st.length > 1 ? st.slice(0, -1) : st)), []);
   const tab = useCallback((next: Screen) => setStack(['home'].concat(next === 'home' ? [] : [next]) as Screen[]), []);
+
+  const moveTripStop = useCallback((from: number, to: number) => {
+    setTripStops((current) => {
+      if (to < 0 || to >= current.length || from < 0 || from >= current.length || from === to) return current;
+      const next = [...current];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
+    clearTripResult();
+  }, []);
+
+  function removeTripStopWithUndo(index: number) {
+    const stop = tripStops[index];
+    if (!stop) return;
+    if (pendingTripStopUndoTimer.current) clearTimeout(pendingTripStopUndoTimer.current);
+    setTripStops((current) => current.filter((item) => item.id !== stop.id));
+    setPendingTripStopUndo({ stop, index });
+    clearTripResult();
+    pendingTripStopUndoTimer.current = setTimeout(() => {
+      setPendingTripStopUndo((pending) => pending?.stop.id === stop.id ? null : pending);
+      pendingTripStopUndoTimer.current = null;
+    }, 2000);
+  }
+
+  function undoTripStopRemoval() {
+    const pending = pendingTripStopUndo;
+    if (!pending) return;
+    if (pendingTripStopUndoTimer.current) {
+      clearTimeout(pendingTripStopUndoTimer.current);
+      pendingTripStopUndoTimer.current = null;
+    }
+    setTripStops((current) => {
+      const restored = [...current];
+      restored.splice(Math.max(0, Math.min(pending.index, restored.length)), 0, pending.stop);
+      return restored;
+    });
+    setRestoredTripStopId(pending.stop.id);
+    setPendingTripStopUndo(null);
+    clearTripResult();
+  }
+
+  useEffect(() => () => {
+    if (pendingTripStopUndoTimer.current) clearTimeout(pendingTripStopUndoTimer.current);
+    if (pendingEmergencyContactUndoTimer.current) clearTimeout(pendingEmergencyContactUndoTimer.current);
+  }, []);
 
   async function persistSavedBlePeers(peers: SavedBlePeer[]) {
     const limitedPeers = peers.slice(0, MAX_SAVED_BLE_PEERS);
@@ -996,13 +1425,13 @@ export default function App() {
   }
 
   async function saveVehicleNumber() {
-    const number = vehicleNumberDraft.trim();
+    const number = vehicleNumberDraft.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
     if (!number) {
       Alert.alert('Vehicle number required', 'Enter a vehicle registration number to save.');
       return;
     }
-    if (number.length > 20) {
-      Alert.alert('Vehicle number too long', 'Vehicle registration numbers must be 20 characters or fewer.');
+    if (!/^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4}$/.test(number)) {
+      Alert.alert('Invalid vehicle number', 'Enter a valid Indian vehicle registration number, such as KA03AB1234.');
       return;
     }
     try {
@@ -1050,13 +1479,40 @@ export default function App() {
     }
   }
 
-  async function removeEmergencyContact(contactId: string) {
-    const updatedContacts = emergencyContacts.filter((contact) => contact.id !== contactId);
+  async function removeEmergencyContactWithUndo(index: number) {
+    const contact = emergencyContacts[index];
+    if (!contact) return;
+    if (pendingEmergencyContactUndoTimer.current) clearTimeout(pendingEmergencyContactUndoTimer.current);
+    const updatedContacts = emergencyContacts.filter((item) => item.id !== contact.id);
     try {
       await AsyncStorage.setItem('safepath-emergency-contacts', JSON.stringify(updatedContacts));
       setEmergencyContacts(updatedContacts);
+      setPendingEmergencyContactUndo({ contact, index });
+      pendingEmergencyContactUndoTimer.current = setTimeout(() => {
+        setPendingEmergencyContactUndo((pending) => pending?.contact.id === contact.id ? null : pending);
+        pendingEmergencyContactUndoTimer.current = null;
+      }, 2000);
     } catch (error) {
       Alert.alert('Could not remove contact', error instanceof Error ? error.message : 'Please try again.');
+    }
+  }
+
+  async function undoEmergencyContactRemoval() {
+    const pending = pendingEmergencyContactUndo;
+    if (!pending) return;
+    if (pendingEmergencyContactUndoTimer.current) {
+      clearTimeout(pendingEmergencyContactUndoTimer.current);
+      pendingEmergencyContactUndoTimer.current = null;
+    }
+    const restoredContacts = [...emergencyContacts];
+    restoredContacts.splice(Math.max(0, Math.min(pending.index, restoredContacts.length)), 0, pending.contact);
+    try {
+      await AsyncStorage.setItem('safepath-emergency-contacts', JSON.stringify(restoredContacts));
+      setEmergencyContacts(restoredContacts);
+      setRestoredEmergencyContactId(pending.contact.id);
+      setPendingEmergencyContactUndo(null);
+    } catch (error) {
+      Alert.alert('Could not restore contact', error instanceof Error ? error.message : 'Please try again.');
     }
   }
 
@@ -1886,10 +2342,13 @@ export default function App() {
       : 'Calculating';
 
     return (
-      <View style={{ flex: 1, paddingTop: 38 }}>
+      <View style={s.navigationMapContainer}>
         <MapMock
+          key={navigationMapSession}
           variant={variant}
           hazards={variant === 2}
+          routePanelBottomInset={132}
+          mapControlsBottomInset={112}
           initialCenter={sharedLocation ? { lat: sharedLocation.lat, lng: sharedLocation.lng } : undefined}
           destination={sharedLocation ? { lat: sharedLocation.lat, lng: sharedLocation.lng } : null}
           nearbyPlaces={nearbyPlaces}
@@ -1900,31 +2359,23 @@ export default function App() {
           onRouteSummary={setRouteSummary}
         />
 
-        <View style={s.etaBar}>
-          <View>
-            <Text style={s.etaBig}>{durationText}</Text>
-            <Text style={s.muted}>{distanceText}</Text>
-          </View>
-          <View>
-            <Text style={s.etaBig}>{arrivalText}</Text>
-            <Text style={s.muted}>Arrival</Text>
-          </View>
-          <Pressable style={s.exit} onPress={back}><Text style={s.btnText}>Exit</Text></Pressable>
-        </View>
-
-        <View style={s.actionRow}>
-          {[
-            ['🧭', 'Route Info', () => go('route')],
-            [navigationVehicleIcon[navigationVehicle], 'Vehicle', selectNavigationVehicle],
-            ['⤴', 'Share', () => { void shareCurrentRoute(); }],
-            ['🔖', 'Save Place', saveSearchedPlace],
-          ].map(([i, l, fn]) => (
-            <Pressable key={l as string} style={s.actionBtn} onPress={fn as () => void}>
-              <Text style={{ fontSize: 20 }}>{i as string}</Text>
-              <Text style={s.mini}>{l as string}</Text>
-            </Pressable>
-          ))}
-        </View>
+        <NavigationBottomSheet
+          durationText={durationText}
+          distanceText={distanceText}
+          arrivalText={arrivalText}
+          vehicleLabel={navigationVehicleIcon[navigationVehicle]}
+          onHome={() => tab('home')}
+          onExit={() => {
+            setSharedLocation(null);
+            setNearbyPlaces([]);
+            setRouteSummary(null);
+            setNavigationMapSession((session) => session + 1);
+          }}
+          onRouteInfo={() => go('route')}
+          onVehicle={selectNavigationVehicle}
+          onShare={() => { void shareCurrentRoute(); }}
+          onSavePlace={saveSearchedPlace}
+        />
       </View>
     );
   }
@@ -1939,9 +2390,19 @@ export default function App() {
           onChange={(place) => { setTripOrigin(place); clearTripResult(); }}
         />
         <Section>Intermediate Stops</Section>
+        {tripStops.length > 1 ? <Text style={s.tripReorderHint}>Hold and drag a stop to change its priority.</Text> : null}
         {tripStops.map((stop, index) => (
-          <View key={stop.id} style={s.tripStop}>
-            <View style={{ flex: 1 }}>
+          <React.Fragment key={stop.id}>
+            {pendingTripStopUndo?.index === index
+              ? <TripStopUndoStrip message="Stop removed" onUndo={undoTripStopRemoval} />
+              : null}
+            <SwipeableTripStop
+              index={index}
+              enabled={tripStops.length > 1}
+              onMove={moveTripStop}
+              onDelete={removeTripStopWithUndo}
+              restored={restoredTripStopId === stop.id}
+            >
               <TripPlaceField
                 label={`Stop ${index + 1}`}
                 value={stop.place}
@@ -1950,39 +2411,12 @@ export default function App() {
                   clearTripResult();
                 }}
               />
-            </View>
-            <View style={s.tripStopActions}>
-              <Pressable
-                disabled={index === 0}
-                onPress={() => {
-                  setTripStops((current) => {
-                    const next = [...current];
-                    [next[index - 1], next[index]] = [next[index], next[index - 1]];
-                    return next;
-                  });
-                  clearTripResult();
-                }}
-              ><Text style={[s.tripAction, index === 0 && s.disabledText]}>↑</Text></Pressable>
-              <Pressable
-                disabled={index === tripStops.length - 1}
-                onPress={() => {
-                  setTripStops((current) => {
-                    const next = [...current];
-                    [next[index + 1], next[index]] = [next[index], next[index + 1]];
-                    return next;
-                  });
-                  clearTripResult();
-                }}
-              ><Text style={[s.tripAction, index === tripStops.length - 1 && s.disabledText]}>↓</Text></Pressable>
-              <Pressable
-                onPress={() => {
-                  setTripStops((current) => current.filter((item) => item.id !== stop.id));
-                  clearTripResult();
-                }}
-              ><Text style={[s.tripAction, { color: C.red }]}>×</Text></Pressable>
-            </View>
-          </View>
+            </SwipeableTripStop>
+          </React.Fragment>
         ))}
+        {pendingTripStopUndo && pendingTripStopUndo.index >= tripStops.length
+          ? <TripStopUndoStrip message="Stop removed" onUndo={undoTripStopRemoval} />
+          : null}
         <Pressable
           style={s.addBtn}
           onPress={() => {
@@ -2151,7 +2585,7 @@ export default function App() {
             </Pressable>
           ))}
         </View>
-        <Btn title={loading ? 'Sending…' : 'Activate Emergency SOS'} danger pill onPress={() => triggerSos('manual')} disabled={loading} />
+        <SlideToConfirm disabled={loading} onConfirm={() => triggerSos('manual')} />
       </>
     );
   }
@@ -2625,9 +3059,21 @@ export default function App() {
           </View>
         </Modal>
 
-        {reportFormOpen ? (
+        <Modal
+          visible={reportFormOpen}
+          transparent
+          animationType="fade"
+          onRequestClose={() => {
+            if (!reportSubmitting) setReportFormOpen(false);
+          }}
+        >
           <View style={s.reportModalBackdrop}>
-            <View style={s.reportModal}>
+            <ScrollView
+              style={s.reportModal}
+              contentContainerStyle={s.reportModalContent}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            >
               <Text style={s.h1}>Create Community Report</Text>
               <Text style={s.muted}>Incident type</Text>
               <View style={s.reportTypeGrid}>
@@ -2667,9 +3113,9 @@ export default function App() {
                   );
                 }} /></View>
               </View>
-            </View>
+            </ScrollView>
           </View>
-        ) : null}
+        </Modal>
       </>
     );
   }
@@ -2708,27 +3154,34 @@ export default function App() {
       <>
         <Section>Emergency Contacts</Section>
         {contactsLoading ? <Text style={s.muted}>Loading saved contacts…</Text> : null}
-        {!contactsLoading && emergencyContacts.length === 0 ? (
+        {!contactsLoading && emergencyContacts.length === 0 && !pendingEmergencyContactUndo ? (
           <Text style={s.muted}>No emergency contacts added yet.</Text>
         ) : null}
-        {emergencyContacts.map((contact) => (
-          <View key={contact.id} style={[s.contactCard, s.rowBetween]}>
-            <View style={{ flex: 1 }}>
-              <Text style={s.rowTitle}>{contact.name}</Text>
-              <Text style={s.muted}>{contact.phone}</Text>
-            </View>
-            <Pressable
-              onPress={() => Alert.alert('Remove contact?', `Remove ${contact.name} from emergency contacts?`, [
-                { text: 'Cancel', style: 'cancel' },
-                { text: 'Remove', style: 'destructive', onPress: () => { void removeEmergencyContact(contact.id); } },
-              ])}
-              accessibilityRole="button"
-              accessibilityLabel={`Remove ${contact.name}`}
+        {emergencyContacts.map((contact, index) => (
+          <React.Fragment key={contact.id}>
+            {pendingEmergencyContactUndo?.index === index
+              ? <TripStopUndoStrip message="Contact removed" onUndo={undoEmergencyContactRemoval} />
+              : null}
+            <SwipeableTripStop
+              index={index}
+              enabled={false}
+              onMove={() => {}}
+              onDelete={(contactIndex) => { void removeEmergencyContactWithUndo(contactIndex); }}
+              restored={restoredEmergencyContactId === contact.id}
+              rowType="contact"
             >
-              <Text style={{ color: C.red, fontSize: 18 }}>×</Text>
-            </Pressable>
-          </View>
+              <View style={s.rowBetween}>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.rowTitle}>{contact.name}</Text>
+                  <Text style={s.muted}>{contact.phone}</Text>
+                </View>
+              </View>
+            </SwipeableTripStop>
+          </React.Fragment>
         ))}
+        {pendingEmergencyContactUndo && pendingEmergencyContactUndo.index >= emergencyContacts.length
+          ? <TripStopUndoStrip message="Contact removed" onUndo={undoEmergencyContactRemoval} />
+          : null}
         <Pressable style={s.addBtn} onPress={openContactEditor}>
           <Text style={{ color: C.blueLight }}>＋  Add Contact</Text>
         </Pressable>
@@ -2789,10 +3242,33 @@ export default function App() {
   }
 
   const showHeader = !['splash', 'login', 'reset-password', 'home', 'accident', 'navigate', 'navigate2'].includes(screen);
-  const showTabs = TAB_SCREENS.includes(screen);
+  const showTabs = TAB_SCREENS.includes(screen) && screen !== 'navigate' && screen !== 'navigate2';
   const activeTab: Screen =
     screen === 'navigate2' ? 'navigate' : screen === 'route' ? 'trip' : TABS.some((t) => t.key === screen) ? screen : 'home';
   const isDanger = screen === 'accident' || screen === 'sos';
+
+  useEffect(() => {
+    if (!showTabs) {
+      navAnimations.forEach((progress, index) => {
+        progress.stopAnimation();
+        progress.setValue(TABS[index].key === activeTab ? 1 : 0);
+      });
+      return;
+    }
+
+    const animations = navAnimations.map((progress, index) =>
+      Animated.timing(progress, {
+        toValue: TABS[index].key === activeTab ? 1 : 0,
+        duration: 420,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: false,
+      }),
+    );
+    const transition = Animated.parallel(animations);
+    transition.start();
+
+    return () => transition.stop();
+  }, [activeTab, navAnimations, showTabs]);
 
   return (
     <View style={[s.outer, isDanger && { backgroundColor: '#1D1426' }]}>
@@ -2802,12 +3278,12 @@ export default function App() {
         const { width, height } = event.nativeEvent.layout;
         const bounds = { width, height };
         sosBoundsRef.current = bounds;
-        setSosPosition((current) => {
-          if (current) return current;
+        if (!sosPositionRef.current) {
           const initial = { x: width - 76, y: height - 142 };
           sosPositionRef.current = initial;
-          return initial;
-        });
+          sosAnimatedPosition.setValue(initial);
+          setSosPositionReady(true);
+        }
       }}
     >
       <StatusBar barStyle="light-content" />
@@ -2881,14 +3357,14 @@ export default function App() {
         <View style={s.vehicleModalBackdrop}>
           <View style={s.vehicleModal}>
             <Text style={s.rowTitle}>My Vehicle</Text>
-            <Text style={[s.muted, { marginTop: 6 }]}>Enter your vehicle registration number.</Text>
+            <Text style={[s.muted, { marginTop: 6 }]}>Enter a valid Indian registration number (for example, KA03AB1234).</Text>
             <View style={[s.inputWrap, { marginTop: 14 }]}>
               <TextInput
                 value={vehicleNumberDraft}
-                onChangeText={setVehicleNumberDraft}
-                placeholder="Vehicle number"
+                onChangeText={(value) => setVehicleNumberDraft(value.replace(/[^a-zA-Z0-9]/g, '').toUpperCase())}
+                placeholder="KA03AB1234"
                 placeholderTextColor={C.muted}
-                maxLength={20}
+                maxLength={11}
                 autoCapitalize="characters"
                 autoCorrect={false}
                 style={s.input}
@@ -3070,14 +3546,27 @@ export default function App() {
         </View>
       </Modal>
       {showHeader ? (
-        <View style={[s.header, ['trip', 'offline', 'profile', 'community', 'sos', 'comm', 'route', 'emergency', 'nearby'].includes(screen) && { marginTop: 24 }, screen === 'settings' && { marginTop: 36 }]}>
-          <Pressable onPress={back} hitSlop={12}><Text style={s.backArrow}>←</Text></Pressable>
-          <Text style={s.headerTitle}>{TITLES[screen]}</Text>
-          <View style={{ width: 24 }} />
+        <View style={s.header}>
+          <Pressable
+            onPress={back}
+            style={s.backButton}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel="Go back"
+          >
+            <ArrowLeft color={C.white} size={20} strokeWidth={2.2} />
+          </Pressable>
+          <Text style={s.headerTitle} numberOfLines={1}>{TITLES[screen]}</Text>
+          <View style={{ width: 40 }} />
         </View>
       ) : null}
       {screen === 'navigate' || screen === 'navigate2' ? (
-        <View style={[s.content, { flex: 1, paddingBottom: 96 }]}>
+        <View
+          style={[
+            s.navigationScreen,
+            Platform.OS === 'android' && { paddingTop: StatusBar.currentHeight ?? 24 },
+          ]}
+        >
           {content()}
         </View>
       ) : (
@@ -3090,27 +3579,58 @@ export default function App() {
         </ScrollView>
       )}
       {!['splash', 'login', 'reset-password', 'sos', 'accident'].includes(screen) ? (
-        <View
+        <Animated.View
           {...sosResponder.panHandlers}
-          style={[s.sosFab, sosPosition ? { left: sosPosition.x, top: sosPosition.y, right: undefined, bottom: undefined } : null]}
+          style={[
+            s.sosFab,
+            sosPositionReady
+              ? { left: sosAnimatedPosition.x, top: sosAnimatedPosition.y, right: undefined, bottom: undefined }
+              : null,
+          ]}
           accessible
           accessibilityRole="button"
           accessibilityLabel="Emergency SOS. Tap to open, or press and hold to drag."
         >
           <Text style={s.sosFabText}>SOS</Text>
-        </View>
+        </Animated.View>
       ) : null}
       {showTabs ? (
         <View style={s.bottomNav}>
-          {TABS.map((t) => {
+          {TABS.map((t, index) => {
             const active = activeTab === t.key;
+            const progress = navAnimations[index];
             return (
-              <Pressable key={t.key} onPress={() => tab(t.key)} style={s.navItem}>
-                <View style={[s.navIconWrap, active && { backgroundColor: C.panel2 }]}>
-                  <Text style={[s.navIcon, active && { color: C.white }]}>{t.icon}</Text>
-                </View>
-                <Text style={[s.navLabel, active && { color: C.blueLight }]}>{t.label}</Text>
-              </Pressable>
+              <Animated.View
+                key={t.key}
+                style={[
+                  s.navItem,
+                  { flexGrow: progress.interpolate({ inputRange: [0, 1], outputRange: [0.8, 1.9] }) },
+                ]}
+              >
+                <Pressable
+                  onPress={() => tab(t.key)}
+                  style={[s.navPressable, active && s.navPressableActive]}
+                  accessibilityRole="tab"
+                  accessibilityLabel={t.label}
+                  accessibilityState={{ selected: active }}
+                >
+                  <t.icon color={active ? C.white : C.muted} size={20} strokeWidth={2} />
+                  <Animated.Text
+                    numberOfLines={1}
+                    style={[
+                      s.navLabel,
+                      active && s.navLabelActive,
+                      {
+                        width: progress.interpolate({ inputRange: [0, 1], outputRange: [0, 44] }),
+                        opacity: progress,
+                        transform: [{ translateX: progress.interpolate({ inputRange: [0, 1], outputRange: [-8, 0] }) }],
+                      },
+                    ]}
+                  >
+                    {t.label}
+                  </Animated.Text>
+                </Pressable>
+              </Animated.View>
             );
           })}
         </View>
@@ -3143,9 +3663,9 @@ const s = StyleSheet.create({
   white12: { color: C.white, fontSize: 12 },
   link: { color: C.blueLight, fontSize: 12, textAlign: 'right', marginTop: 8, marginBottom: 6 },
 
-  header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 18, paddingVertical: 14 },
-  headerTitle: { color: C.white, fontSize: 18, fontWeight: '600' },
-  backArrow: { color: C.white, fontSize: 24 },
+  header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 18, paddingTop: 50, paddingBottom: 14 },
+  headerTitle: { flex: 1, color: C.white, fontSize: 18, fontWeight: '600', textAlign: 'center' },
+  backButton: { width: 40, height: 40, borderRadius: 12, backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' },
 
   btn: { backgroundColor: C.blue, borderRadius: 9, minHeight: 46, justifyContent: 'center', alignItems: 'center', marginTop: 14 },
   btnOutline: { backgroundColor: 'transparent', borderWidth: 1, borderColor: '#3F4BA5' },
@@ -3161,9 +3681,25 @@ const s = StyleSheet.create({
   section: { color: C.white, fontSize: 15, fontWeight: '700', marginTop: 20, marginBottom: 10 },
   group: { backgroundColor: C.panel, borderRadius: 11, borderWidth: 1, borderColor: C.border, overflow: 'hidden', marginTop: 12 },
   placeSuggestion: { backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, borderRadius: 8, padding: 10, marginTop: 6 },
-  tripStop: { flexDirection: 'row', alignItems: 'flex-start', gap: 8 },
-  tripStopActions: { flexDirection: 'row', gap: 10, marginTop: 42, alignItems: 'center' },
-  tripAction: { color: C.blueLight, fontSize: 20, fontWeight: '700', paddingHorizontal: 2 },
+  tripSwipeWrap: { position: 'relative' },
+  tripSwipeDeleteUnderlay: { position: 'absolute', top: 0, bottom: 10, left: 0, right: 0, flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 6, backgroundColor: C.red, borderRadius: 10, paddingRight: 18 },
+  contactSwipeDeleteUnderlay: { top: 8, bottom: 0 },
+  tripSwipeDeleteHidden: { opacity: 0 },
+  tripSwipeDeleteText: { color: C.white, fontSize: 13, fontWeight: '700' },
+  tripStop: { gap: 6, marginBottom: 10, backgroundColor: C.bg, borderRadius: 9 },
+  tripStopDragging: { backgroundColor: C.panel2, borderRadius: 10, elevation: 8, zIndex: 1 },
+  tripReorderHint: { color: C.muted, fontSize: 11, marginTop: -4, marginBottom: 4 },
+  tripUndoStrip: { minHeight: 48, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#54252F', borderRadius: 9, paddingHorizontal: 14, marginTop: 12, marginBottom: 10 },
+  tripUndoText: { color: C.white, fontSize: 13 },
+  tripUndoAction: { color: '#FFD166', fontSize: 14, fontWeight: '700', paddingVertical: 8, paddingHorizontal: 6 },
+  tripPlaceFieldRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  tripPlaceFieldMain: { flex: 1, minWidth: 0 },
+  holdConfirm: { width: 68, height: 48, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+  holdConfirmSegment: { position: 'absolute', width: 5, height: 4, borderRadius: 2, backgroundColor: '#7792FF' },
+  holdConfirmTrack: { position: 'absolute', left: 0, top: -10, width: 68, height: 68, borderRadius: 34, borderWidth: 4, borderColor: '#24263C', backgroundColor: '#17182A' },
+  holdConfirmButton: { position: 'absolute', left: 10, top: 0, width: 48, height: 48, borderRadius: 24, alignItems: 'center', justifyContent: 'center', backgroundColor: '#1D1D32' },
+  holdConfirmButtonComplete: { backgroundColor: '#16352F' },
+  holdConfirmCaption: { position: 'absolute', top: 58, left: 0, right: 0, color: '#A9A9C3', fontSize: 9, lineHeight: 12, textAlign: 'center' },
   disabledText: { opacity: 0.3 },
   vehicleGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   tripChoice: { width: '48%', minHeight: 72, alignItems: 'center', justifyContent: 'center', gap: 5, backgroundColor: C.panel, borderRadius: 10, borderWidth: 1, borderColor: C.border, padding: 10 },
@@ -3200,11 +3736,28 @@ const s = StyleSheet.create({
   pin: { position: 'absolute', fontSize: 20 },
   userDot: { position: 'absolute', bottom: 40, left: '44%', width: 46, height: 46, borderRadius: 23, backgroundColor: C.blue, alignItems: 'center', justifyContent: 'center', borderWidth: 3, borderColor: '#B7BCFF' },
 
-  etaBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: C.bg2, borderRadius: 12, borderWidth: 1, borderColor: C.border, padding: 14, marginTop: 12 },
-  etaBig: { color: C.white, fontSize: 19, fontWeight: '700' },
-  exit: { backgroundColor: C.red, borderRadius: 8, paddingHorizontal: 22, paddingVertical: 12 },
-  actionRow: { flexDirection: 'row', gap: 8, marginTop: 10 },
-  actionBtn: { flex: 1, backgroundColor: C.panel, borderRadius: 10, borderWidth: 1, borderColor: C.border, alignItems: 'center', paddingVertical: 10 },
+  navigationScreen: { flex: 1, paddingTop: 12 },
+  navigationMapContainer: { flex: 1, position: 'relative' },
+  navigationSheet: { position: 'absolute', left: 12, right: 12, bottom: 16, backgroundColor: C.bg2, borderRadius: 24, borderWidth: 1, borderColor: C.border, overflow: 'hidden', zIndex: 20, elevation: 20 },
+  navigationSheetDragArea: { height: 40, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', borderBottomWidth: 1, borderBottomColor: C.border },
+  navigationSheetPeekDragArea: { height: 18, borderBottomWidth: 0 },
+  navigationSheetGrabber: { position: 'absolute', top: 8, alignSelf: 'center', width: 38, height: 4, borderRadius: 2, backgroundColor: '#737A98' },
+  navigationPeekContent: { flex: 1, paddingHorizontal: 8, paddingBottom: 2 },
+  navigationPeekInfoRow: { minHeight: 62, position: 'relative', flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
+  navigationPeekMetrics: { width: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 66 },
+  navigationPeekHome: { position: 'absolute', left: 10, zIndex: 1, width: 54, height: 54, borderRadius: 27, backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' },
+  navigationPeekSummary: { flex: 1, alignItems: 'center', justifyContent: 'center', minWidth: 0 },
+  navigationPeekDivider: { width: 1, height: 42, backgroundColor: '#555B75', marginHorizontal: 2 },
+  navigationPeekDuration: { color: C.green, fontSize: 14, fontWeight: '700' },
+  navigationPeekArrival: { color: C.white, fontSize: 12, fontWeight: '600' },
+  navigationPeekSubtitle: { color: C.muted, fontSize: 9, marginTop: 1 },
+  navigationPeekExit: { position: 'absolute', right: 10, zIndex: 1, width: 58, height: 40, borderRadius: 9, backgroundColor: C.red, alignItems: 'center', justifyContent: 'center' },
+  navigationPeekExitContent: { flexDirection: 'row', alignItems: 'center', gap: 2 },
+  navigationPeekExitText: { color: C.white, fontSize: 11, fontWeight: '700' },
+  navigationPeekActions: { flexDirection: 'row', alignItems: 'stretch', gap: 6, borderTopWidth: 1, borderTopColor: C.border, paddingTop: 7 },
+  navigationPeekAction: { flex: 1, minWidth: 0, minHeight: 68, alignItems: 'center', justifyContent: 'center', gap: 4, backgroundColor: C.panel, borderRadius: 10, borderWidth: 1, borderColor: C.border, paddingHorizontal: 2 },
+  navigationPeekActionIcon: { color: C.blueLight, fontSize: 20 },
+  navigationPeekActionLabel: { color: C.muted, fontSize: 9, fontWeight: '600', textAlign: 'center' },
 
   addBtn: { alignItems: 'center', backgroundColor: C.panel, borderRadius: 9, borderWidth: 1, borderColor: C.border, padding: 13, marginTop: 10 },
   vehicleRow: { flexDirection: 'row', gap: 8 },
@@ -3213,6 +3766,13 @@ const s = StyleSheet.create({
   sosOuter: { alignSelf: 'center', width: 230, height: 230, borderRadius: 115, backgroundColor: 'rgba(235,60,67,0.15)', alignItems: 'center', justifyContent: 'center', marginTop: 10 },
   sosInner: { width: 180, height: 180, borderRadius: 90, backgroundColor: C.red, alignItems: 'center', justifyContent: 'center', borderWidth: 12, borderColor: '#7A2A3C' },
   sosText: { color: C.white, fontWeight: '800', fontSize: 40 },
+  sosSlideSection: { marginTop: 16 },
+  sosSlideTrack: { height: 58, width: '100%', marginTop: 10, borderRadius: 29, borderWidth: 1, borderColor: C.border, backgroundColor: C.panel2, overflow: 'hidden', justifyContent: 'center' },
+  sosSlideFill: { position: 'absolute', top: 0, bottom: 0, left: 0, borderRadius: 28, backgroundColor: C.red },
+  sosSlideLabel: { color: C.white, fontSize: 13, fontWeight: '700', textAlign: 'center' },
+  sosSlideThumb: { position: 'absolute', left: 0, top: 0, width: 56, height: 56, borderRadius: 28, borderWidth: 2, borderColor: '#C6C9FF', backgroundColor: C.blueLight, alignItems: 'center', justifyContent: 'center' },
+  sosSlideThumbConfirmed: { backgroundColor: C.green, borderColor: '#B3FFE1' },
+  sosSlideThumbText: { color: C.white, fontSize: 34, lineHeight: 38, fontWeight: '700' },
 
   catGrid: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 14, rowGap: 14 },
   cat: { width: '25%', alignItems: 'center' },
@@ -3242,8 +3802,9 @@ const s = StyleSheet.create({
   navigationVehicleSelected: { color: C.green, fontSize: 18, fontWeight: '700', marginLeft: 'auto' },
   savedPlaceOption: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: C.panel, borderRadius: 9, borderWidth: 1, borderColor: C.border, padding: 12, marginTop: 10 },
   contactCard: { backgroundColor: C.panel, borderRadius: 10, borderWidth: 1, borderColor: C.border, padding: 12, marginTop: 8 },
-  reportModalBackdrop: { position: 'absolute', left: -18, right: -18, top: -18, bottom: 0, backgroundColor: 'rgba(4,7,20,0.82)', justifyContent: 'center', padding: 18 },
-  reportModal: { backgroundColor: C.bg2, borderRadius: 12, borderWidth: 1, borderColor: C.border, padding: 16, marginTop: 204 },
+  reportModalBackdrop: { flex: 1, backgroundColor: 'rgba(4,7,20,0.82)', justifyContent: 'center', padding: 18 },
+  reportModal: { flexGrow: 0, maxHeight: '90%', backgroundColor: C.bg2, borderRadius: 12, borderWidth: 1, borderColor: C.border },
+  reportModalContent: { padding: 16 },
   reportTypeGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10, marginBottom: 12 },
   reportTypeChip: { width: '48%', backgroundColor: C.panel, borderRadius: 8, borderWidth: 1, borderColor: C.border, paddingVertical: 10, alignItems: 'center' },
   reportPhoto: { width: '100%', height: 180, borderRadius: 10, marginBottom: 8, backgroundColor: C.panel },
@@ -3256,16 +3817,19 @@ const s = StyleSheet.create({
 
   sosFab: { position: 'absolute', right: 18, bottom: 84, width: 58, height: 58, borderRadius: 29, backgroundColor: C.red, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: '#FF8A8A', elevation: 8, shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 5, shadowOffset: { width: 0, height: 3 } },
   sosFabText: { color: C.white, fontSize: 14, fontWeight: '800' },
-  bottomNav: { position: 'absolute', bottom: 0, left: 0, right: 0, height: 72, backgroundColor: C.bg2, borderTopWidth: 1, borderTopColor: '#282D49', flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center' },
-  navItem: { alignItems: 'center', padding: 4 },
-  navIconWrap: { width: 42, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },
-  navIcon: { color: C.muted, fontSize: 20 },
-  navLabel: { color: C.muted, fontSize: 10, marginTop: 2 },
+  bottomNav: { position: 'absolute', bottom: 0, left: 0, right: 0, height: 72, backgroundColor: C.bg2, borderTopWidth: 1, borderTopColor: '#282D49', flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 10 },
+  navItem: { flexBasis: 0, minWidth: 0, height: 44 },
+  navPressable: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', borderRadius: 24, paddingHorizontal: 4 },
+  navPressableActive: { backgroundColor: C.blue, paddingHorizontal: 10 },
+  navLabel: { color: C.white, fontSize: 11, fontWeight: '600', overflow: 'hidden' },
+  navLabelActive: { marginLeft: 6 },
 });
 
 function MapMock(props: {
   variant?: 1 | 2;
   hazards?: boolean;
+  routePanelBottomInset?: number;
+  mapControlsBottomInset?: number;
   initialCenter?: { lat: number; lng: number };
   destination?: { lat: number; lng: number } | null;
   nearbyPlaces?: NearbyPlace[];
@@ -3275,8 +3839,10 @@ function MapMock(props: {
   return (
     <LiveMap
       apiUrl={API_URL}
-      style={{ height: 585 }}
+      style={{ flex: 1 }}
       showRoutePanel
+      routePanelBottomInset={props.routePanelBottomInset}
+      mapControlsBottomInset={props.mapControlsBottomInset}
       initialCenter={props.initialCenter}
       destination={props.destination}
       nearbyPlaces={props.nearbyPlaces}

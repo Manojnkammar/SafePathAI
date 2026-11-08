@@ -1,14 +1,78 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View, ViewStyle } from 'react-native';
+import { ArrowDown, ArrowLeft, ArrowRight, Navigation, Volume2, VolumeX } from 'lucide-react-native';
+import { ActivityIndicator, Alert, Animated, Easing, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View, ViewStyle } from 'react-native';
 import * as Location from 'expo-location';
+import * as Speech from 'expo-speech';
 import { WebView } from 'react-native-webview';
 
 type Pt = { lat: number; lng: number };
 type Hazard = { id: string; incident_type: string; severity: string; lat: number; lng: number; radius_m: number };
-type RawRoute = { points: Pt[]; distance_m: number; duration_s: number };
+type RouteStep = { instruction: string; distance_m: number; location: Pt; modifier?: string };
+type RawRoute = { points: Pt[]; distance_m: number; duration_s: number; steps: RouteStep[] };
 type DisplayRoute = RawRoute & { safety: number; hit: string[]; label: string; color: string };
 type PlaceResult = { lat: number; lng: number; name: string };
 export type NearbyPlace = { lat: number; lng: number; name: string; distance_m: number; category: string };
+
+function formatRouteStep(step: any, coordinates: Pt[]): RouteStep[] {
+  const modifier = typeof step.maneuver?.modifier === 'string' ? step.maneuver.modifier : undefined;
+  const roadName = typeof step.name === 'string' && step.name ? ` onto ${step.name}` : '';
+  const maneuverType = step.maneuver?.type;
+  let instruction: string;
+
+  if (maneuverType === 'arrive') instruction = 'You have arrived at your destination';
+  else if (maneuverType === 'depart') instruction = `Head ${modifier ?? 'straight'}${roadName}`;
+  else if (maneuverType === 'roundabout' || maneuverType === 'rotary') instruction = `Enter the roundabout${roadName}`;
+  else if (maneuverType === 'merge' || maneuverType === 'on ramp' || maneuverType === 'off ramp') instruction = `${maneuverType}${modifier ? ` ${modifier}` : ''}${roadName}`;
+  else if (maneuverType === 'continue' || maneuverType === 'new name') instruction = `Continue ${modifier ?? 'straight'}${roadName}`;
+  else if (maneuverType === 'fork' || maneuverType === 'end of road') instruction = `Keep ${modifier ?? 'straight'}${roadName}`;
+  else if (maneuverType === 'turn') instruction = `Turn ${modifier ?? 'ahead'}${roadName}`;
+  else instruction = `Continue${roadName}`;
+
+  const maneuverLocation = step.maneuver?.location;
+  const location = Array.isArray(maneuverLocation) && maneuverLocation.length >= 2
+    ? { lat: Number(maneuverLocation[1]), lng: Number(maneuverLocation[0]) }
+    : coordinates[0];
+  if (!location || !Number.isFinite(location.lat) || !Number.isFinite(location.lng)) return [];
+  return [{
+    instruction: instruction.charAt(0).toUpperCase() + instruction.slice(1),
+    distance_m: Number(step.distance) || 0,
+    location,
+    modifier,
+  }];
+}
+
+function NextDirectionCard({ instruction, distance, modifier }: { instruction: string; distance: string; modifier?: string }) {
+  const opacity = useRef(new Animated.Value(0)).current;
+  const translateY = useRef(new Animated.Value(-10)).current;
+  const DirectionIcon = modifier?.includes('left')
+    ? ArrowLeft
+    : modifier?.includes('right')
+      ? ArrowRight
+      : modifier === 'uturn'
+        ? ArrowDown
+        : Navigation;
+
+  useEffect(() => {
+    opacity.setValue(0);
+    translateY.setValue(-10);
+    const animation = Animated.parallel([
+      Animated.timing(opacity, { toValue: 1, duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+      Animated.timing(translateY, { toValue: 0, duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+    ]);
+    animation.start();
+    return () => animation.stop();
+  }, [distance, instruction, opacity, translateY]);
+
+  return (
+    <Animated.View style={[st.directionCard, { opacity, transform: [{ translateY }] }]}>
+      <DirectionIcon color="#fff" size={23} strokeWidth={2.5} />
+      <View style={st.directionTextWrap}>
+        <Text style={st.directionInstruction} numberOfLines={1}>{instruction}</Text>
+        <Text style={st.directionDistance} numberOfLines={1}>{distance}</Text>
+      </View>
+    </Animated.View>
+  );
+}
 
 function isBackendPlace(value: unknown): value is PlaceResult {
   if (!value || typeof value !== 'object') return false;
@@ -51,6 +115,8 @@ type Props = {
   onRouteSummary?: (summary: RouteSummary | null) => void;
   showSearch?: boolean;
   showRoutePanel?: boolean;
+  routePanelBottomInset?: number;
+  mapControlsBottomInset?: number;
   plannedRoutes?: PlannedRoute[];
   plannedWaypoints?: Pt[];
   selectedRouteIndex?: number;
@@ -134,18 +200,25 @@ function rankAlternatives(raw: RawRoute[], hazards: Hazard[]): DisplayRoute[] {
 async function osrmRoutes(a: Pt, b: Pt): Promise<RawRoute[]> {
   const url =
     'https://router.project-osrm.org/route/v1/driving/' + a.lng + ',' + a.lat + ';' + b.lng + ',' + b.lat +
-    '?overview=full&geometries=geojson&alternatives=3';
+    '?overview=full&geometries=geojson&alternatives=3&steps=true';
   const r = await fetch(url);
   if (!r.ok) throw new Error('osrm');
   const j = await r.json();
   if (j.code !== 'Ok' || !Array.isArray(j.routes) || j.routes.length === 0) {
     throw new Error('OSRM returned no routes');
   }
-  return j.routes.map((x: any) => ({
-    points: x.geometry.coordinates.map((c: number[]) => ({ lat: c[1], lng: c[0] })),
-    distance_m: x.distance,
-    duration_s: x.duration,
-  }));
+  return j.routes.map((x: any) => {
+    const points: Pt[] = x.geometry.coordinates.map((c: number[]) => ({ lat: c[1], lng: c[0] }));
+    const steps: RouteStep[] = (x.legs ?? []).flatMap((leg: any) => (
+      (leg.steps ?? []).flatMap((step: any) => formatRouteStep(step, points))
+    ));
+    return {
+      points,
+      distance_m: x.distance,
+      duration_s: x.duration,
+      steps,
+    };
+  });
 }
 
 async function backendRoutes(apiUrl: string, a: Pt, b: Pt): Promise<RawRoute[]> {
@@ -173,6 +246,7 @@ async function backendRoutes(apiUrl: string, a: Pt, b: Pt): Promise<RawRoute[]> 
       points,
       distance_m: Number(x.distance_m ?? 0),
       duration_s: Number(x.eta_s ?? x.duration_s ?? 0),
+      steps: [],
     };
   });
 }
@@ -247,13 +321,14 @@ function buildHtml(dark: boolean) {
 <style>
 html,body,#map{height:100%;margin:0;background:#0b1220}
 .leaflet-container{font-family:-apple-system,Roboto,sans-serif}
-.leaflet-top.leaflet-left{top:118px}
+.leaflet-bottom.leaflet-left{bottom:112px;left:10px}
 .me{width:18px;height:18px;border-radius:50%;background:#3b82f6;border:3px solid #fff;box-shadow:0 0 0 6px rgba(59,130,246,.3)}
 .pin{width:22px;height:22px;border-radius:50% 50% 50% 0;background:#ef4444;border:2px solid #fff;transform:rotate(-45deg)}
 .waypoint{width:26px;height:26px;border-radius:13px;background:#16a34a;border:2px solid #fff;color:#fff;font-weight:700;font-size:12px;line-height:22px;text-align:center;box-shadow:0 1px 5px #000}
 .nearby{width:24px;height:24px;border-radius:50%;background:#f59e0b;border:2px solid #fff;color:#111827;font-weight:700;font-size:14px;line-height:20px;text-align:center;box-shadow:0 1px 5px #000}
 </style></head><body><div id="map"></div><script>
-var map=L.map('map',{zoomControl:true,zoomAnimation:true}).setView([12.9716,77.5946],13);
+var map=L.map('map',{zoomControl:false,zoomAnimation:true}).setView([12.9716,77.5946],13);
+L.control.zoom({position:'bottomleft'}).addTo(map);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,subdomains:'abcd',attribution:'&copy; OpenStreetMap &copy; CARTO'}).addTo(map);
 var layer=L.layerGroup().addTo(map),userMk=null,startMk=null,centered=false,lastFocus=0,lastKey='';
 var COLORS={low:'#facc15',medium:'#fb923c',high:'#ef4444',critical:'#b91c1c'};
@@ -324,6 +399,8 @@ export default function LiveMap({
   onRouteSummary,
   showSearch = true,
   showRoutePanel = true,
+  routePanelBottomInset = 10,
+  mapControlsBottomInset,
   plannedRoutes,
   plannedWaypoints = [],
   selectedRouteIndex = 0,
@@ -337,12 +414,22 @@ export default function LiveMap({
 
   const [hazards, setHazards] = useState<Hazard[]>([]);
   const [user, setUser] = useState<Pt | null>(null);
+  const [navigationPosition, setNavigationPosition] = useState<Pt | null>(null);
+  const [voiceAlertsEnabled, setVoiceAlertsEnabled] = useState(false);
+  const hazardsRef = useRef(hazards);
+  const destinationRef = useRef(destination);
+  const voiceAlertsEnabledRef = useRef(voiceAlertsEnabled);
+  const announcedHazardsRef = useRef(new Set<string>());
+  const announcedDestinationRef = useRef<string | null>(null);
+  hazardsRef.current = hazards;
+  voiceAlertsEnabledRef.current = voiceAlertsEnabled;
   const [startMode, setStartMode] = useState<'current' | 'custom'>('current');
   const [startSelected, setStartSelected] = useState(false);
   const [startPlace, setStartPlace] = useState<PlaceResult | null>(null);
   const [startQuery, setStartQuery] = useState('');
   const [startSearching, setStartSearching] = useState(false);
   const [dest, setDest] = useState<Pt | null>(destination);
+  destinationRef.current = dest;
   const [destName, setDestName] = useState('');
   const [raw, setRaw] = useState<RawRoute[]>([]);
   const [sel, setSel] = useState(0);
@@ -351,6 +438,7 @@ export default function LiveMap({
   const [searching, setSearching] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [routePanelDismissed, setRoutePanelDismissed] = useState(false);
 
   const origin = !startSelected
     ? null
@@ -360,7 +448,15 @@ export default function LiveMap({
   const originKey = origin ? origin.lat.toFixed(4) + ',' + origin.lng.toFixed(4) : 'unset';
 
   useEffect(() => {
-    if (destination) setDest(destination);
+    if (destination) {
+      setDest(destination);
+      setRoutePanelDismissed(false);
+    }
+  }, [destination?.lat, destination?.lng]);
+
+  useEffect(() => {
+    announcedHazardsRef.current.clear();
+    announcedDestinationRef.current = null;
   }, [destination?.lat, destination?.lng]);
 
   /* GPS */
@@ -400,6 +496,81 @@ export default function LiveMap({
     return () => clearInterval(id);
   }, [loadHazards]);
 
+  useEffect(() => {
+    if (!voiceAlertsEnabled) {
+      void Speech.stop();
+      return;
+    }
+
+    let active = true;
+    let subscription: Location.LocationSubscription | null = null;
+    const announce = (message: string) => {
+      if (!voiceAlertsEnabledRef.current) return;
+      void Speech.speak(message, { language: 'en-IN', rate: 0.95 });
+    };
+
+    async function startVoiceAlerts() {
+      try {
+        let permission = await Location.getForegroundPermissionsAsync();
+        if (permission.status !== 'granted') {
+          permission = await Location.requestForegroundPermissionsAsync();
+        }
+        if (!active) return;
+        if (permission.status !== 'granted') {
+          setVoiceAlertsEnabled(false);
+          Alert.alert('Location permission required', 'Allow location access to enable spoken navigation alerts.');
+          return;
+        }
+        announce(destinationRef.current ? 'Voice alerts enabled.' : 'Voice alerts enabled. Select a destination to begin.');
+        subscription = await Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.Balanced,
+            timeInterval: 5000,
+            distanceInterval: 25,
+          },
+          ({ coords }) => {
+            if (!active || !voiceAlertsEnabledRef.current) return;
+            const position = { lat: coords.latitude, lng: coords.longitude };
+            setUser(position);
+
+            const currentDestination = destinationRef.current;
+            if (currentDestination && hav(position, currentDestination) <= 150) {
+              const destinationKey = `${currentDestination.lat.toFixed(5)},${currentDestination.lng.toFixed(5)}`;
+              if (announcedDestinationRef.current !== destinationKey) {
+                announcedDestinationRef.current = destinationKey;
+                announce('You are approaching your destination.');
+              }
+            }
+
+            const nearbyHazard = hazardsRef.current.find((hazard) => (
+              hav(position, hazard) <= Math.max(150, hazard.radius_m + 75)
+              && !announcedHazardsRef.current.has(hazard.id)
+            ));
+            if (nearbyHazard) {
+              announcedHazardsRef.current.add(nearbyHazard.id);
+              announce(`Caution. ${nearbyHazard.severity} ${nearbyHazard.incident_type} reported nearby.`);
+            }
+          },
+        );
+        if (!active) subscription.remove();
+      } catch (error) {
+        if (!active) return;
+        setVoiceAlertsEnabled(false);
+        Alert.alert(
+          'Voice alerts unavailable',
+          error instanceof Error ? error.message : 'Could not start location updates for navigation alerts.',
+        );
+      }
+    }
+
+    void startVoiceAlerts();
+    return () => {
+      active = false;
+      subscription?.remove();
+      void Speech.stop();
+    };
+  }, [voiceAlertsEnabled]);
+
   /* fetch road routes when the destination changes */
   useEffect(() => {
     if (!dest || (!origin && plannedRoutes === undefined)) {
@@ -411,6 +582,7 @@ export default function LiveMap({
         points: route.points,
         distance_m: route.distanceM,
         duration_s: route.durationS,
+        steps: [],
       })));
       setSel(selectedRouteIndex);
       setError('');
@@ -472,6 +644,69 @@ export default function LiveMap({
   const displayedRoutes = useMemo(() => routes, [routes]);
   const cur = Math.min(plannedRoutes === undefined ? sel : selectedRouteIndex, Math.max(0, displayedRoutes.length - 1));
   const chosen = displayedRoutes[cur];
+  const chosenSteps = chosen?.steps;
+
+  useEffect(() => {
+    if (!dest || !chosenSteps?.length || Platform.OS === 'web') {
+      setNavigationPosition(user);
+      return;
+    }
+
+    let active = true;
+    let subscription: Location.LocationSubscription | null = null;
+    void Location.watchPositionAsync(
+      { accuracy: Location.Accuracy.Balanced, timeInterval: 5000, distanceInterval: 10 },
+      ({ coords }) => {
+        if (active) setNavigationPosition({ lat: coords.latitude, lng: coords.longitude });
+      },
+    ).then((watcher) => {
+      if (active) subscription = watcher;
+      else watcher.remove();
+    }).catch((error: unknown) => {
+      if (!active) return;
+      setNavigationPosition(user);
+      Alert.alert(
+        'Live directions unavailable',
+        error instanceof Error ? error.message : 'Could not track your location for upcoming directions.',
+      );
+    });
+
+    return () => {
+      active = false;
+      subscription?.remove();
+    };
+  }, [chosenSteps, dest?.lat, dest?.lng, user]);
+
+  const nextDirection = useMemo(() => {
+    if (!chosenSteps?.length) {
+      return { instruction: 'Follow the highlighted route', distance: 'Turn-by-turn guidance unavailable', modifier: undefined };
+    }
+    let closestIndex = 0;
+    let closestDistance = Number.POSITIVE_INFINITY;
+    if (navigationPosition) {
+      chosenSteps.forEach((step, index) => {
+        const distance = hav(navigationPosition, step.location);
+        if (distance < closestDistance) {
+          closestDistance = distance;
+          closestIndex = index;
+        }
+      });
+    } else {
+      const departureIndex = chosenSteps.findIndex((step) => !step.instruction.startsWith('Head '));
+      if (departureIndex >= 0) closestIndex = departureIndex;
+    }
+
+    if (navigationPosition && closestDistance <= 40 && closestIndex < chosenSteps.length - 1) {
+      closestIndex += 1;
+    }
+    const step = chosenSteps[closestIndex];
+    const distance = navigationPosition ? hav(navigationPosition, step.location) : step.distance_m;
+    return {
+      instruction: step.instruction,
+      distance: distance <= 40 ? 'Now' : `In ${fmtDist(distance)}`,
+      modifier: step.modifier,
+    };
+  }, [chosenSteps, navigationPosition]);
 
   useEffect(() => {
     onRouteSummary?.(!busy && chosen ? {
@@ -529,6 +764,7 @@ export default function LiveMap({
         const p = { lat: m.lat, lng: m.lng };
         setDest(p);
         setDestName('Dropped pin');
+        setRoutePanelDismissed(false);
         cbRef.current?.(p, 'Dropped pin');
       }
     } catch {
@@ -565,6 +801,7 @@ export default function LiveMap({
       const p = { lat, lng };
       setDest(p);
       setDestName(name);
+      setRoutePanelDismissed(false);
       setQuery(name);
       setRaw([]);
       setSel(0);
@@ -660,6 +897,7 @@ export default function LiveMap({
     setDestName('');
     setRaw([]);
     setQuery('');
+    setRoutePanelDismissed(false);
   }
 
   return (
@@ -688,22 +926,20 @@ export default function LiveMap({
 
       {showSearch && (!startSelected || !dest) && (
         <View style={st.searchPanel}>
-          {!startSelected ? (
-            <View style={st.startChoiceRow}>
-              <Pressable
-                style={[st.startChoice, startMode === 'current' && st.startChoiceActive]}
-                onPress={useCurrentLocation}
-              >
-                <Text style={st.startChoiceText}>Use current location</Text>
-              </Pressable>
-              <Pressable
-                style={[st.startChoice, startMode === 'custom' && st.startChoiceActive]}
-                onPress={chooseStartingPoint}
-              >
-                <Text style={st.startChoiceText}>Choose starting point</Text>
-              </Pressable>
-            </View>
-          ) : null}
+          <View style={st.startChoiceRow}>
+            <Pressable
+              style={[st.startChoice, startMode === 'current' && st.startChoiceActive]}
+              onPress={useCurrentLocation}
+            >
+              <Text style={st.startChoiceText}>Use current location</Text>
+            </Pressable>
+            <Pressable
+              style={[st.startChoice, startMode === 'custom' && st.startChoiceActive]}
+              onPress={chooseStartingPoint}
+            >
+              <Text style={st.startChoiceText}>Choose starting point</Text>
+            </Pressable>
+          </View>
           {!startSelected && startMode === 'custom' ? (
             <View style={st.searchRow}>
               <TextInput
@@ -741,12 +977,37 @@ export default function LiveMap({
         </View>
       )}
 
-      <View style={st.side}>
+      {dest && chosen && !busy ? (
+        <NextDirectionCard
+          instruction={nextDirection.instruction}
+          distance={nextDirection.distance}
+          modifier={nextDirection.modifier}
+        />
+      ) : null}
+
+      <View style={[st.side, mapControlsBottomInset === undefined ? st.sideTop : { bottom: mapControlsBottomInset }]}>
         <Pressable style={st.roundBtn} onPress={() => setFocus((f) => f + 1)}>
           <Text style={st.roundTxt}>Me</Text>
         </Pressable>
         <Pressable style={st.roundBtn} onPress={loadHazards}>
           <Text style={st.roundTxt}>Sync</Text>
+        </Pressable>
+        <Pressable
+          style={[st.roundBtn, voiceAlertsEnabled && st.voiceAlertsEnabled]}
+          onPress={() => {
+            setVoiceAlertsEnabled((enabled) => {
+              const nextEnabled = !enabled;
+              if (!nextEnabled) void Speech.stop();
+              return nextEnabled;
+            });
+          }}
+          accessibilityRole="button"
+          accessibilityLabel={voiceAlertsEnabled ? 'Mute voice navigation alerts' : 'Unmute voice navigation alerts'}
+          accessibilityState={{ checked: voiceAlertsEnabled }}
+        >
+          {voiceAlertsEnabled
+            ? <Volume2 color="#fff" size={19} />
+            : <VolumeX color="#fff" size={19} />}
         </Pressable>
       </View>
 
@@ -756,8 +1017,8 @@ export default function LiveMap({
         </View>
       )}
 
-      {showRoutePanel && (error || chosen) ? (
-        <View style={st.panel}>
+      {showRoutePanel && !routePanelDismissed && (error || chosen) ? (
+        <View style={[st.panel, { bottom: routePanelBottomInset }]}>
           {error ? <Text style={st.err}>{error}</Text> : null}
           {chosen ? (
             <>
@@ -771,7 +1032,14 @@ export default function LiveMap({
               </View>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginVertical: 6 }}>
                 {displayedRoutes.map((r, i) => (
-                  <Pressable key={i} onPress={() => setSel(i)} style={[st.chip, i === cur && st.chipOn]}>
+                  <Pressable
+                    key={i}
+                    onPress={() => {
+                      setSel(i);
+                      setRoutePanelDismissed(true);
+                    }}
+                    style={[st.chip, i === cur && st.chipOn]}
+                  >
                     <Text style={[st.chipTxt, i === cur && st.chipTxtOn]}>
                       {r.label + ': ' + fmtDur(r.duration_s)}
                     </Text>
@@ -802,6 +1070,27 @@ const st = StyleSheet.create({
     elevation: 10,
     gap: 6,
   },
+  directionCard: {
+    position: 'absolute',
+    top: 10,
+    left: 10,
+    right: 64,
+    minHeight: 58,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    backgroundColor: 'rgba(15,23,42,0.96)',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#475569',
+    zIndex: 9,
+    elevation: 9,
+  },
+  directionTextWrap: { flex: 1, minWidth: 0 },
+  directionInstruction: { color: '#fff', fontSize: 14, fontWeight: '700' },
+  directionDistance: { color: '#cbd5e1', fontSize: 11, marginTop: 2 },
   startChoiceRow: { flexDirection: 'row', gap: 6 },
   startChoice: {
     flex: 1,
@@ -825,11 +1114,13 @@ const st = StyleSheet.create({
   },
   goBtn: { backgroundColor: '#3b82f6', borderRadius: 12, paddingHorizontal: 16, justifyContent: 'center' },
   goTxt: { color: '#fff', fontWeight: '700' },
-  side: { position: 'absolute', right: 10, top: 64, gap: 8 },
+  side: { position: 'absolute', right: 10, gap: 8 },
+  sideTop: { top: 64 },
   roundBtn: {
     width: 44, height: 44, borderRadius: 22, backgroundColor: 'rgba(15,23,42,0.92)',
     alignItems: 'center', justifyContent: 'center',
   },
+  voiceAlertsEnabled: { backgroundColor: '#1d4ed8', borderWidth: 1, borderColor: '#60a5fa' },
   roundTxt: { color: '#fff', fontSize: 12, fontWeight: '700' },
   busy: { position: 'absolute', top: 64, left: 10, backgroundColor: 'rgba(15,23,42,0.92)', borderRadius: 12, padding: 8 },
   panel: {
